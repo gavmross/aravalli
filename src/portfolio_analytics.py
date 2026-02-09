@@ -774,13 +774,14 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
     if not pd.api.types.is_datetime64_any_dtype(df['last_pymnt_d']):
         df['last_pymnt_d'] = pd.to_datetime(df['last_pymnt_d'])
 
-    # Loan age at snapshot (months since origination), capped at term_months
-    # A 36-month loan can't be "older" than 36 months even if issue_d is far back
+    # Loan age at snapshot (months since origination), capped at term - 1
+    # A 36-month loan caps at age 35 (month 0 through 35 = 36 months).
+    # This keeps all ages within clean 6-month buckets (0-5 through 54-59).
     raw_age = (
         (SNAPSHOT_DATE - df['issue_d']).dt.days / 30.44
     ).round().astype(int)
     if 'term_months' in df.columns:
-        df['loan_age_months'] = np.minimum(raw_age, df['term_months'].astype(int))
+        df['loan_age_months'] = np.minimum(raw_age, df['term_months'].astype(int) - 1)
     else:
         df['loan_age_months'] = raw_age
 
@@ -824,14 +825,18 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
     if fully_paid_mask.any():
         df.loc[fully_paid_mask, 'payoff_month'] = df.loc[fully_paid_mask, 'last_pymnt_d']
 
-    # === Loan age at each transition ===
+    # === Loan age at each transition (capped at term_months - 1) ===
+    term_cap = df['term_months'].astype(int) - 1 if 'term_months' in df.columns else None
     for col in ['delinquent_month', 'late_31_120_month', 'default_month', 'payoff_month']:
         age_col = col.replace('_month', '_age')
         mask = df[col].notna()
         if mask.any():
-            df.loc[mask, age_col] = (
+            raw = (
                 (df.loc[mask, col] - df.loc[mask, 'issue_d']).dt.days / 30.44
             ).round().astype(int)
+            if term_cap is not None:
+                raw = np.minimum(raw, term_cap.loc[mask])
+            df.loc[mask, age_col] = raw
 
     # === Cured loans ===
     df['cured_from_late'] = (

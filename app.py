@@ -911,17 +911,17 @@ with tab3:
                 key="t3_purchase_price",
             )
         with s2:
-            stress_upside_pct = st.slider(
+            stress_upside_pct_int = st.slider(
                 "Stress / Upside %",
-                min_value=0.05,
-                max_value=0.50,
-                value=0.15,
-                step=0.01,
-                format="%.2f",
+                min_value=5,
+                max_value=50,
+                value=15,
+                step=1,
                 key="t3_stress_upside",
             )
 
         t3_purchase_price = t3_purchase_price_pct / 100
+        stress_upside_pct = stress_upside_pct_int / 100
 
         # Build scenarios
         scenarios = build_scenarios(

@@ -57,15 +57,15 @@ assert abs(result - 322.67) < 0.01, f"Expected 322.67, got {result}"
 - SMM = 0.01 → CPR = 1 - (1-0.01)^12 = 0.113562 (11.36%)
 - CPR = 0.20 → SMM = 1 - (1-0.20)^(1/12) = 0.018439
 
-**CDR ↔ MDR**:
-- CDR = 0.10 → MDR = 1 - (1-0.10)^(1/12) = 0.008742
+**CDR — conditional, trailing 12-month**:
+- 12 monthly MDRs all equal to 0.005 (0.5%/month) → avg_MDR = 0.005 → CDR = 1-(1-0.005)^12 = 0.05841 (5.84%)
+- 12 monthly MDRs varying between 0.003 and 0.007 → avg_MDR = 0.005 → CDR = 5.84% (same — averaging smooths volatility)
+- Zero defaults in all 12 months → all MDRs = 0 → CDR = 0
+- Verify round-trip: CDR → MDR = 1-(1-CDR)^(1/12) ≈ avg_MDR. Example: CDR = 0.05841 → MDR = 1-(1-0.05841)^(1/12) ≈ 0.005 ✓
+- Verify conditional CDR ≠ cumulative default rate (they measure different things; only the conditional rate is called CDR)
+- Verify each monthly MDR is non-negative and ≤ 1.0
 - CDR = 0.00 → MDR = 0.00 (boundary case)
 - CDR = 1.00 → MDR = 1.00 (boundary case)
-
-**CDR annualization**:
-- Cumulative CDR = 0.10 over 24 months (WALA) → Annual CDR = 1 - (1 - 0.10)^(12/24) = 1 - 0.90^0.5 = 0.05132
-- Cumulative CDR = 0.18 over 60 months (WALA) → Annual CDR = 1 - (1 - 0.18)^(12/60) = 1 - 0.82^0.2 = 0.03893
-- Verify: feeding annualized CDR back through compounding recovers cumulative: 1 - (1 - CDR_annual)^(WALA/12) ≈ CDR_cumulative
 
 ### Step 4: Cash Flow Projection Checks
 

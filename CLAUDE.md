@@ -143,7 +143,12 @@ Each module in `src/` must be independently importable. No global state. Functio
 > **For detailed formulas, worked examples, and edge cases, read `.claude/skills/lending-math/SKILL.md`.**
 > **For full column reference and strata definitions, read `.claude/skills/data-schema/SKILL.md`.**
 
-Key rates: SMM, CPR, MDR, CDR (cumulative and annualized), Loss Severity, Recovery Rate, WAC, WAM, WALA, IRR. All formulas with derivations are in `docs/calculations.md` and the lending-math skill.
+Key rates: SMM, CPR, MDR, CDR (conditional, annualized), Loss Severity, Recovery Rate, WAC, WAM, WALA, IRR. All formulas with derivations are in `docs/calculations.md` and the lending-math skill.
+
+- **MDR (Monthly Default Rate, observed)**: For a given calendar month M: `MDR_M = defaults_in_month_M / performing_balance_at_start_of_month_M`. This parallels SMM for prepayments.
+- **CDR (Conditional Default Rate)**: `CDR = 1 - (1 - avg_MDR)^12` where `avg_MDR` is the average of 12 trailing monthly MDRs (Apr 2018 – Mar 2019). This is the PRIMARY rate used in cash flow projections. Uses the dv01 conditional methodology.
+- **Cumulative Default Rate (reference only)**: `cumulative_default_rate = sum(defaulted_upb) / sum(funded_amnt)`. Raw lifetime default rate. Displayed for reference but NOT used in cash flow engine. Do NOT call this "CDR" — CDR refers only to the conditional (annualized) rate.
+- **MDR (Monthly Default Rate, for projections)**: `MDR = 1 - (1 - CDR)^(1/12)`. The round-trip is: observe monthly MDRs → average → annualize to CDR → cash flow engine converts back to MDR via this formula.
 
 ---
 
@@ -203,7 +208,7 @@ These are display-only, do NOT feed into the cash flow engine. They use only bas
 
 ### Cash Flow Functions (in `src/cashflow_engine.py`)
 
-- `compute_pool_assumptions(df_all, df_current) → dict` — Base-case CDR (annualized from cumulative), CPR, loss severity. Returns {cdr, cdr_cumulative, cpr, loss_severity, recovery_rate}.
+- `compute_pool_assumptions(df_all, df_current) → dict` — Base-case CDR (conditional, 12-month trailing average MDR, annualized via dv01 methodology), CPR, loss severity. Requires `reconstruct_loan_timeline()` to have been called on `df_all` first (for `default_month` and `payoff_month` columns). Returns `{'cdr': float, 'cumulative_default_rate': float, 'avg_mdr': float, 'monthly_mdrs': list[float], 'cpr': float, 'loss_severity': float, 'recovery_rate': float}`. Where: `cdr` = conditional CDR (PRIMARY, used in cash flow projections); `cumulative_default_rate` = raw lifetime rate (display/reference only, NOT called CDR); `avg_mdr` = average monthly default rate (un-annualized, for display); `monthly_mdrs` = list of 12 individual monthly MDRs (for display, shows trend/volatility); `cpr` = single-month CPR from calc_amort (UNCHANGED); `loss_severity`, `recovery_rate` = unchanged.
 - `compute_pool_characteristics(df_current) → dict` — Pool aggregates: {total_upb, wac, wam, monthly_payment}.
 - `project_cashflows(pool_chars, cdr, cpr, loss_severity, purchase_price) → pd.DataFrame` — Monthly projection loop. Returns month, date, beginning_balance, defaults, loss, recovery, interest, scheduled_principal, prepayments, total_principal, ending_balance, total_cashflow.
 - `calculate_irr(cashflows_df, pool_chars, purchase_price) → float` — Annualized IRR from projected cash flows.
@@ -247,7 +252,12 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - Loan Age Status Distribution: stacked bar with toggles (monthly/6-month, count/UPB)
 
 ### Tab 2: Cash Flow Projection
-- Base assumptions as metric cards (read-only)
+- Show computed base assumptions as metric cards:
+  - **CDR (Conditional, 12mo trailing)**: the annualized rate driving projections
+  - **Cumulative Default Rate**: raw lifetime rate — shown in smaller text or tooltip as reference (do NOT label as "CDR")
+  - **Avg MDR**: un-annualized monthly default rate for transparency
+  - **CPR**: single-month from calc_amort (unchanged)
+  - **Loss Severity** and **Recovery Rate**: unchanged
 - Pool characteristics as metric cards
 - User inputs: Purchase Price (%), CDR (%), CPR (%)
 - IRR display, "Solve for Price" input
@@ -273,6 +283,12 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - `pytest tests/ -v` from project root
 - Test files mirror src modules. See `tests/test_*.py` for all test cases.
 - All 130 tests currently pass (57 portfolio_analytics, 73 other modules).
+- `compute_pool_assumptions` CDR:
+  - Create synthetic cohort: 1000 loans originated Jan 2017. In each of the 12 trailing months (Apr 2018 – Mar 2019), 5 loans default each month with $10K exposure each. Performing balance ~$8M/month. Verify avg_MDR ≈ $50K/$8M ≈ 0.625%/month, CDR = 1-(1-0.00625)^12 ≈ 7.24%
+  - Zero defaults in all 12 months: all MDRs = 0, CDR = 0
+  - Verify monthly_mdrs list has exactly 12 elements
+  - Verify CDR round-trip: CDR → MDR via projection formula ≈ avg_mdr from observations
+  - Verify cumulative_default_rate is also returned (different value from conditional CDR, and not labeled as CDR)
 
 ---
 
@@ -290,7 +306,9 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - **ALWAYS use sequential-thinking** MCP before implementing financial math.
 - **ALWAYS read the relevant skill file** before writing code in that domain.
 - **Cash flows and scenarios operate on Current loans with March 2019 last payment date ONLY.**
-- **CDR from ALL loans; CPR from Current March 2019 only.**
+- **CDR is computed from ALL loans in the cohort** using the dv01 conditional methodology: trailing 12-month average MDR, annualized. Cumulative default rate (NOT called CDR) retained for display only.
+- **`compute_pool_assumptions()` requires `reconstruct_loan_timeline()`** on df_all first (for `default_month` and `payoff_month` columns used in conditional CDR).
+- **CPR from Current March 2019 only.**
 - **Loss severity is FIXED across all three scenarios** — only CDR and CPR shift.
 - **All base/stress/upside defaults are cohort-specific**, not global averages.
 - Projection starts at t=0 (March 2019), first payment at t=1 (April 2019).

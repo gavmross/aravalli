@@ -94,7 +94,7 @@ This is the most important column for segmentation. All analysis branches on the
 
 | Status | Meaning | Used In |
 |--------|---------|---------|
-| `Current` | Loan is performing, payments current | Cash flow projections (if March 2019 last payment), credit metrics, CPR calculation |
+| `Current` | Loan is performing, payments current | Cash flow projections (if March 2019 last payment), credit metrics, CPR calculation (as part of active loans pool) |
 | `Fully Paid` | Loan paid off in full | CDR calculation (denominator), credit metrics |
 | `Charged Off` | Loan defaulted, written off | CDR (numerator), loss severity, recovery rate |
 | `Late (31-120 days)` | 31-120 days delinquent | Transition matrix, credit metrics |
@@ -179,7 +179,7 @@ These are the columns available for filtering in the Streamlit sidebar:
 - "Select All" is the default for every filter
 - Filters are AND-combined (grade=B AND term=36 AND vintage=2018Q1)
 - Tab 1 (Portfolio Analytics) uses ALL loans matching the filter
-- Tab 2 (Cash Flow Projection) and Tab 3 (Scenario Analysis) further filter to Current loans with March 2019 `last_pymnt_d` for projections, but use ALL loans for CDR and loss severity
+- Tab 2 (Cash Flow Projection) and Tab 3 (Scenario Analysis) further filter to active loans (Current with March 2019 `last_pymnt_d` + all delinquent regardless of payment date) for projections, but use ALL loans for CDR and loss severity
 
 ---
 
@@ -197,9 +197,9 @@ Understanding which loans go into which calculation is critical:
 ### For Cash Flow Projection (Tab 2) and Scenario Analysis (Tab 3)
 
 - **CDR**: Computed from ALL loans in the filtered strata (need Charged Off in numerator, all in denominator)
-- **CPR**: Computed from Current loans with `last_pymnt_d == '2019-03-01'` ONLY
+- **CPR**: Computed from active loans — Current with `last_pymnt_d == '2019-03-01'` plus all delinquent (In Grace + Late) regardless of last payment date
 - **Loss Severity**: Computed from Charged Off loans in the filtered strata
-- **Pool characteristics (UPB, WAC, WAM, monthly_payment)**: Current loans with `last_pymnt_d == '2019-03-01'` ONLY
+- **Pool characteristics (UPB, WAC, WAM, monthly_payment)**: Active loans — Current with `last_pymnt_d == '2019-03-01'` plus all delinquent (In Grace + Late) regardless of last payment date
 - **Cash flow projections**: Run on the pool defined by the pool characteristics above
 
 ### SQL Helpers
@@ -208,11 +208,11 @@ Understanding which loans go into which calculation is critical:
 -- All loans in a vintage
 SELECT * FROM loans WHERE issue_quarter = '2018Q1';
 
--- Current loans with March 2019 payment (cash flow population)
+-- Active loans (cash flow population): Current with March 2019 payment + all delinquent
 SELECT * FROM loans
 WHERE issue_quarter = '2018Q1'
-  AND loan_status = 'Current'
-  AND last_pymnt_d = '2019-03-01';
+  AND ((loan_status = 'Current' AND last_pymnt_d = '2019-03-01')
+    OR loan_status IN ('In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)'));
 
 -- Charged Off loans (for CDR and loss severity)
 SELECT * FROM loans

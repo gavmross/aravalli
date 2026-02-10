@@ -120,11 +120,65 @@ assert abs(result - 322.67) < 0.01, f"Expected 322.67, got {result}"
   - Upside CPR = 0.12 × 1.15 = 0.138
 - Loss severity must be IDENTICAL across all three scenarios
 
-### Step 8: Run pytest
+### Step 8: State-Transition Model Checks
+
+**Pipeline timing** (all-Current pool):
+- Pool: $1M UPB across ages 10/20/30, all Current
+- Using empirical transition probs with bucket_size=1, states='7state'
+- Verify months 1-4 have zero defaults (pipeline hasn't reached Late_3→Charged Off yet)
+- Verify first defaults appear at month 5
+
+**State ramp-up**:
+- Month 1: delinquent_upb > 0 (Current→Delinquent transitions start immediately)
+- Month 2: late_1_upb > 0 (Delinquent→Late_1)
+- Month 3: late_2_upb > 0 (Late_1→Late_2)
+- Month 4: late_3_upb > 0 (Late_2→Late_3)
+
+**Balance conservation**:
+- Each month: sum of all state UPBs should decrease monotonically (principal paydown + defaults)
+- ending_balance should be non-negative
+
+**Cash flow source verification**:
+- Interest comes from Current UPB only: `interest = current_upb × (WAC / 12)`
+- Prepayments from Current→Fully Paid transitions only
+- Defaults from Late_3→Charged Off (+ any other→Charged Off)
+
+**Zero-default case**:
+- Set all Current→Delinquent rates to 0 in transition probs
+- Verify losses = 0 for all months
+
+**No-skip constraint**:
+- Current cannot jump directly to Late_1, Late_2, Late_3, or Charged Off
+- Verify `to_late_1_pct`, `to_late_2_pct`, `to_late_3_pct`, `to_charged_off_pct` are 0 for `from_status = Current`
+
+**Prepayment rate override**:
+- `adjust_prepayment_rates(age_probs, cpr)` replaces Current→Fully Paid with CPR-derived SMM
+- SMM = 1 - (1 - CPR)^(1/12). Example: CPR = 0.0149 → SMM ≈ 0.00125
+- After adjustment: all Current rows have `to_fully_paid_pct` = SMM (constant across ages)
+- Non-Current rows are unchanged
+- Current rows still sum to 1.0
+- Delinquency rates (Current→Delinquent) are NOT affected by the CPR adjustment
+- Verify prepayments in month 1 ≈ total_current_upb × SMM (not empirical rate)
+
+**IRR compatibility**:
+- Output of `project_cashflows_transition()` works with `calculate_irr()`
+- `solve_price_transition()` round-trip: solved price produces target IRR within 100bp
+
+### Step 9: Transition Scenario Checks
+
+- Base probs unchanged after `build_scenarios_transition()`
+- Stress: Current→Delinquent increases, all cure rates decrease
+- Upside: Current→Delinquent decreases, all cure rates increase
+- Late_3→Charged Off NOT directly stressed (increases only via re-normalization)
+- All rows sum to 1.0 in all scenarios
+- Scenario IRR ordering: Stress < Base < Upside
+- Loss severity FIXED across all scenarios
+
+### Step 10: Run pytest
 
 ```bash
 source .env/bin/activate
-pytest tests/test_amortization.py tests/test_cashflow_engine.py tests/test_scenario_analysis.py -v
+pytest tests/test_amortization.py tests/test_cashflow_engine.py tests/test_scenario_analysis.py tests/test_portfolio_analytics.py -v
 ```
 
 All tests must pass. If any fail, investigate and report exactly which calculation is wrong, what the expected value is, and what the actual value is.
@@ -136,13 +190,15 @@ Report results as:
 ```
 FINANCIAL VALIDATION REPORT
 ============================
-Amortization:     ✓ PASS / ✗ FAIL (details)
-Rate Conversions: ✓ PASS / ✗ FAIL (details)
-Cash Flow Engine: ✓ PASS / ✗ FAIL (details)
-IRR Calculation:  ✓ PASS / ✗ FAIL (details)
-Price Solver:     ✓ PASS / ✗ FAIL (details)
-Scenario Logic:   ✓ PASS / ✗ FAIL (details)
-pytest Suite:     ✓ PASS / ✗ FAIL (N passed, M failed)
+Amortization:           ✓ PASS / ✗ FAIL (details)
+Rate Conversions:       ✓ PASS / ✗ FAIL (details)
+Cash Flow Engine:       ✓ PASS / ✗ FAIL (details)
+IRR Calculation:        ✓ PASS / ✗ FAIL (details)
+Price Solver:           ✓ PASS / ✗ FAIL (details)
+Scenario Logic:         ✓ PASS / ✗ FAIL (details)
+State-Transition Model: ✓ PASS / ✗ FAIL (details)
+Transition Scenarios:   ✓ PASS / ✗ FAIL (details)
+pytest Suite:           ✓ PASS / ✗ FAIL (N passed, M failed)
 ```
 
 For any FAIL, include: the function name, the input values, the expected output, the actual output, and the magnitude of the error.

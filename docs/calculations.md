@@ -14,6 +14,7 @@ This document defines every financial formula used in the Lending Club Portfolio
 6. [IRR Calculation](#6-irr-calculation)
 7. [Price Solver](#7-price-solver)
 8. [Scenario Analysis](#8-scenario-analysis)
+9. [State-Transition Cash Flow Model](#9-state-transition-cash-flow-model)
 
 ---
 
@@ -98,20 +99,37 @@ SMM = 1 - (1 - CPR)^(1/12)    # Annual to monthly (used in projections)
 - CPR = 1 - (1 - 0.01)^12 = 1 - 0.99^12 = 1 - 0.8864 = **11.36%**
 - Reverse: SMM = 1 - (1 - 0.1136)^(1/12) = 1 - 0.8864^(1/12) = **0.01** (verified)
 
-### CDR -> MDR (Default Rates)
+### CDR <-> MDR (Default Rates)
 
-**CDR (Cumulative Default Rate)** is the historical annual default fraction. **MDR (Monthly Default Rate)** is the monthly equivalent used in projections.
+**CDR (Conditional Default Rate)** is the annualized default rate derived from observed monthly default rates using the dv01 conditional methodology. **MDR (Monthly Default Rate)** is the monthly rate used in projections.
 
+**Observed MDR** (for a given calendar month M):
+```
+MDR_M = defaults_in_month_M / performing_balance_at_start_of_month_M
+```
+
+**CDR from observed MDRs** (trailing 12-month average):
+```
+avg_MDR = mean(MDR_1, MDR_2, ..., MDR_12)    # Apr 2018 – Mar 2019
+CDR = 1 - (1 - avg_MDR)^12
+```
+
+**MDR from CDR** (for projections):
 ```
 MDR = 1 - (1 - CDR)^(1/12)
 ```
 
+The round-trip is: observe monthly MDRs → average → annualize to CDR → cash flow engine converts back to MDR.
+
 **Worked example**:
-- CDR = 0.10 (10% annual default rate)
-- MDR = 1 - (1 - 0.10)^(1/12) = 1 - 0.90^(1/12) = **0.877%** monthly
-- Sanity check: 1 - (1 - 0.00877)^12 = 0.10 (verified)
+- 12 monthly MDRs all equal to 0.005 (0.5%/month)
+- avg_MDR = 0.005
+- CDR = 1 - (1 - 0.005)^12 = 1 - 0.995^12 = **5.84%**
+- Round-trip: MDR = 1 - (1 - 0.0584)^(1/12) = 1 - 0.9416^(1/12) = **0.005** (verified)
 
 **Important**: Do NOT use `CDR / 12` as an approximation. The compounding formula is exact and must be used.
+
+**Note**: The **Cumulative Default Rate** (`sum(defaulted_upb) / sum(funded_amnt)`) is a separate metric retained for display/reference only. It is NOT called CDR and is NOT used in cash flow projections.
 
 ---
 
@@ -119,27 +137,43 @@ MDR = 1 - (1 - CDR)^(1/12)
 
 Implemented in `src/cashflow_engine.py: compute_pool_assumptions()`.
 
-### CDR (Cumulative Default Rate)
+### CDR (Conditional Default Rate)
 
-Computed from **ALL loans** in the filtered strata:
+Computed from **ALL loans** in the filtered strata using the dv01 conditional methodology.
+
+**Requires**: `reconstruct_loan_timeline()` must have been called on `df_all` first (for `default_month` and `payoff_month` columns).
+
+For each of 12 trailing months (Apr 2018 – Mar 2019):
 
 ```
-defaulted_upb = sum(funded_amnt - total_rec_prncp)   [for Charged Off loans only]
-total_originated_upb = sum(funded_amnt)               [for ALL loans in cohort]
-CDR = defaulted_upb / total_originated_upb
+1. Identify defaults: loans whose default_month falls in [month_start, month_end)
+   default_upb = sum(funded_amnt - total_rec_prncp)  [for defaults, clipped ≥ 0]
+
+2. Estimate performing balance at start of month:
+   - Loans originated before month_start
+   - Not yet defaulted (default_month is null or > month_start)
+   - Not yet paid off (payoff_month is null or > month_start)
+   - Balance estimated via amortization formula: calc_balance(funded_amnt, int_rate, pmt, age)
+
+3. MDR_M = default_upb / performing_balance
 ```
 
-| Variable | Source | Scope |
-|----------|--------|-------|
-| `funded_amnt` | Original loan amount | All loans |
-| `total_rec_prncp` | Principal received to date | Charged Off loans |
-| `defaulted_upb` | Unrecovered principal at charge-off | Charged Off loans |
+Then annualize:
+```
+avg_MDR = mean(MDR_1, MDR_2, ..., MDR_12)
+CDR = 1 - (1 - avg_MDR)^12
+```
 
-**Rationale**: CDR uses all loans in the denominator (including Current, Fully Paid, and Charged Off) to represent the true default rate for the cohort.
+**Cumulative Default Rate** (reference only, NOT called CDR):
+```
+cumulative_default_rate = sum(defaulted_upb) / sum(funded_amnt)    [all Charged Off loans]
+```
+
+This raw lifetime rate is displayed for reference but is NOT used in cash flow projections.
 
 ### CPR (Conditional Prepayment Rate)
 
-Computed from **Current loans with March 2019 last payment date only**:
+Computed from **all active loans**: Current loans with March 2019 last payment date plus all delinquent loans (In Grace + Late 16-30 + Late 31-120) regardless of last payment date:
 
 ```
 total_beginning_balance = sum(last_pmt_beginning_balance)
@@ -183,7 +217,7 @@ recovery_rate = sum(capped_recoveries) / sum(exposure)
 
 ## 4. Pool-Level Weighted Averages
 
-Implemented in `src/cashflow_engine.py: compute_pool_characteristics()`. All computed from **Current loans with March 2019 last payment date only**.
+Implemented in `src/cashflow_engine.py: compute_pool_characteristics()`. All computed from **active loans**: Current with March 2019 last payment date plus all delinquent loans (In Grace + Late) regardless of last payment date.
 
 ### WAC (Weighted Average Coupon)
 
@@ -209,11 +243,13 @@ WAM = round(sum(updated_remaining_term * out_prncp) / sum(out_prncp))
 monthly_payment = sum(installment)
 ```
 
-Sum of all individual loan installments for the Current March 2019 pool.
+Sum of all individual loan installments for the active March 2019 pool.
 
 ---
 
-## 5. Monthly Cash Flow Projection
+## 5. Monthly Cash Flow Projection (Simple Model)
+
+> **Note**: Sections 5-8 describe the Simple (flat CDR/CPR) model implemented in `project_cashflows()`, `solve_price()`, `build_scenarios()`, and `compare_scenarios()`. These functions exist in the codebase but are **not currently used by the dashboard**, which uses the State-Transition model described in [Section 9](#9-state-transition-cash-flow-model-advanced). These sections are retained for reference.
 
 Implemented in `src/cashflow_engine.py: project_cashflows()`.
 
@@ -416,6 +452,154 @@ Under normal conditions:
 - **Stress IRR < Base IRR < Upside IRR** (higher defaults hurt returns)
 - **Stress losses > Base losses > Upside losses** (more defaults = more losses)
 - **Stress WAL > Base WAL > Upside WAL** (slower prepayments extend life)
+
+---
+
+## 9. State-Transition Cash Flow Model
+
+Implemented in `src/cashflow_engine.py: project_cashflows_transition()`, with transition probabilities from `src/portfolio_analytics.py: compute_age_transition_probabilities()`.
+
+This is the active model used by the dashboard. It uses the same pool-level WAC, WAM, and monthly_payment as the Simple model (Sections 5-8) but determines defaults and prepayments via age-specific transition probabilities rather than flat CDR/CPR rates.
+
+### 7 States
+
+| State | Type | Description |
+|-------|------|-------------|
+| Current | Transient | Performing loans |
+| Delinquent (0-30) | Transient | Missed 1 payment (Grace + Late 16-30 combined) |
+| Late_1 | Transient | 1st month of Late (31-120) |
+| Late_2 | Transient | 2nd month of Late (31-120) |
+| Late_3 | Transient | 3rd month of Late (31-120) |
+| Charged Off | Absorbing | Terminal default |
+| Fully Paid | Absorbing | Prepaid or matured |
+
+### Delinquency Pipeline
+
+Defaults flow through a 5-month pipeline instead of hitting immediately:
+
+```
+Current → Delinquent (0-30) → Late_1 → Late_2 → Late_3 → Charged Off
+```
+
+**Key consequence**: For an all-Current pool, the first defaults appear at month 5 (not month 1).
+
+### Transition Probabilities
+
+Probabilities are empirically derived from the dataset using `compute_age_transition_probabilities(df, bucket_size=1, states='7state')`. Each row contains:
+
+```
+(from_status, age) → {to_current_pct, to_delinquent_0_30_pct, to_late_1_pct,
+                       to_late_2_pct, to_late_3_pct, to_charged_off_pct,
+                       to_fully_paid_pct}
+```
+
+- Probabilities are looked up by individual loan age (monthly granularity)
+- For ages beyond the data range, the nearest available age's probabilities are used
+- Each row sums to 1.0
+
+### Pool State
+
+The pool is tracked as `{state: {loan_age: upb}}`:
+
+```python
+pool_state = {
+    'states': {
+        'Current': {10: 500000, 20: 300000, 30: 200000},
+        'Delinquent (0-30)': {},
+        'Late_1': {}, 'Late_2': {}, 'Late_3': {},
+        'Charged Off': {}, 'Fully Paid': {},
+    },
+    'total_upb': 1000000,
+    'wac': 0.1269,
+    'wam': 32,
+    'monthly_payment': 35000,
+}
+```
+
+LC statuses are mapped to model states:
+- Current → Current
+- In Grace Period / Late (16-30 days) → Delinquent (0-30)
+- Late (31-120 days) → Late_1, Late_2, or Late_3 (based on months since entering late status)
+
+### Monthly Loop
+
+For each month t = 1 to num_months:
+
+```
+1. TRANSITION: For each (state, age) with UPB > 0:
+   - Look up transition probs for (from_status, age)
+   - Multiply UPB by each probability → distribute to new states at age+1
+
+2. CASH FLOWS:
+   - interest = total_current_upb × (WAC / 12)
+   - sched_principal = monthly_payment - interest  (capped ≥ 0, ≤ current_upb)
+   - prepayments = Σ Current[age] × p(Current→Fully Paid | age)
+   - new_defaults = Σ Late_3[age] × p(Late_3→Charged Off | age)
+     + any other state→Charged Off transitions
+   - losses = new_defaults × loss_severity
+   - recoveries = new_defaults × recovery_rate
+   - total_cashflow = interest + sched_principal + prepayments + recoveries
+
+3. UPDATE STATE:
+   - New Current[age+1] = stays + all cured
+   - Subtract sched_principal proportionally from Current buckets
+   - Roll other states forward (Delinq→Late_1, Late_1→Late_2, etc.)
+   - Accumulate defaults and payoffs
+```
+
+### Prepayment Rate Override
+
+The empirical `Current → Fully Paid` transition probabilities from the historical data include **all** payoffs — both voluntary prepayments and loans reaching maturity. This overstates the forward-looking prepayment rate for currently performing loans (many of which are mid-term).
+
+Before projection, the engine calls `adjust_prepayment_rates(age_probs, cpr)` which:
+
+1. Converts the pool-level CPR to a monthly SMM: `SMM = 1 - (1 - CPR)^(1/12)`
+2. Replaces all `Current → Fully Paid` probabilities with this constant SMM
+3. Adds the difference back to `Current → Current` to maintain row sum = 1.0
+
+This means the **state-transition model drives defaults only** (through the delinquency pipeline), while **prepayments use the same constant CPR** as the Simple model. The CPR is derived from the pool's historical single-month prepayment behavior (from `compute_pool_assumptions()`), and the user can override it on Tab 2.
+
+**Example**: CPR = 1.49% → SMM = 1 - (1 - 0.0149)^(1/12) = 0.00125 (0.125%/month). This replaces the empirical ~2.8%/month rate.
+
+### Key Design Decisions
+
+- **Interest from Current UPB only**: Only performing (Current) loans accrue interest.
+- **Prepayments use CPR-derived SMM, not empirical transition rates**: Forward-looking prepayment behavior is driven by the constant pool-level CPR, not the historical `Current → Fully Paid` rate (which includes maturity payoffs).
+- **Defaults from Late_3→Charged Off**: Primary default path (other state→Charged Off transitions also captured).
+- **Losses NOT subtracted from investor cashflow**: `total_cashflow = interest + sched_principal + prepayments + recoveries`. Losses are tracked but not deducted (investor receives recovery portion).
+- **Same pool-level WAC/WAM/monthly_payment as Simple model**: Only the default/prepayment mechanism differs.
+
+### Price Solver (Transition)
+
+Implemented in `src/cashflow_engine.py: solve_price_transition()`.
+
+Since the projection is independent of purchase price (price only affects the initial outlay in IRR), the engine projects cash flows once and then uses brentq to solve for price:
+
+```python
+cf_df = project_cashflows_transition(...)  # Project once
+def objective(price):
+    return calculate_irr(cf_df, pool_chars, price) - target_irr
+solved_price = brentq(objective, 0.50, 1.50)
+```
+
+### Transition Scenario Analysis
+
+Implemented in `src/scenario_analysis.py: build_scenarios_transition()`.
+
+Instead of shifting CDR/CPR, scenarios shift the transition probabilities themselves:
+
+**Stress** (per row of the transition matrix):
+- `Current→Delinquent` × `(1 + stress_pct)` — more delinquency
+- `Current→Fully Paid` × `(1 - stress_pct)` — less prepayment
+- All cure rates (any non-Current state → Current) × `(1 - stress_pct)` — harder to cure
+- `Late_3→Charged Off` is NOT directly stressed — it increases mechanically via re-normalization
+- After multipliers: clamp all probs to [0, 1], then adjust residual column to make row sum to 1
+
+**Upside**: opposite multipliers.
+
+**Loss severity**: FIXED across all scenarios (same as Simple model).
+
+**Expected ordering**: Stress IRR < Base IRR < Upside IRR.
 
 ---
 

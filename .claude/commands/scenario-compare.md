@@ -3,7 +3,7 @@ Run the three-scenario comparison for a filtered cohort and display results.
 ## Arguments
 
 This command accepts optional arguments. If none provided, use defaults:
-- Vintage: 2018Q1 (or first available vintage with sufficient Current loans)
+- Vintage: 2018Q1 (or first available vintage with sufficient active loans)
 - Grade: All grades
 - Term: 36 months
 - Purchase price: 0.95
@@ -37,18 +37,19 @@ df = calc_amort(df, verbose=False)
 VINTAGE = '2018Q1'
 TERM = 36
 df_cohort = df[(df['issue_quarter'] == VINTAGE) & (df['term_months'] == TERM)]
-df_current = df_cohort[
-    (df_cohort['loan_status'] == 'Current') &
-    (df_cohort['last_pymnt_d'] == '2019-03-01')
+non_current_active = ['In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+df_active = df_cohort[
+    ((df_cohort['loan_status'] == 'Current') & (df_cohort['last_pymnt_d'] == '2019-03-01'))
+    | (df_cohort['loan_status'].isin(non_current_active))
 ]
 
 print(f"Cohort: {VINTAGE}, {TERM}-month")
-print(f"Total loans: {len(df_cohort):,} | Current (March 2019): {len(df_current):,}")
+print(f"Total loans: {len(df_cohort):,} | Active: {len(df_active):,}")
 print()
 
 # Compute base assumptions
-assumptions = compute_pool_assumptions(df_cohort, df_current)
-pool_chars = compute_pool_characteristics(df_current)
+assumptions = compute_pool_assumptions(df_cohort, df_active)
+pool_chars = compute_pool_characteristics(df_active)
 
 # Build scenarios (default multipliers)
 scenarios = build_scenarios(assumptions)

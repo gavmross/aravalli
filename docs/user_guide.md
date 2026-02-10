@@ -71,7 +71,7 @@ python scripts/export_to_sqlite.py
 
 **Expected runtime**: 2-5 minutes depending on hardware.
 
-**Verify**: After running, `data/loans.db` should exist and be approximately 2-3 GB.
+**Verify**: After running, `data/loans.db` should exist and be approximately 200 MB (the column whitelist reduces the original ~2-3 GB dataset significantly).
 
 ---
 
@@ -81,14 +81,14 @@ python scripts/export_to_sqlite.py
 pytest tests/ -v
 ```
 
-The test suite contains 101 tests across 4 modules:
+The test suite contains 174 tests across 4 modules:
 
 | Test File | Tests | Coverage |
 |-----------|------:|----------|
 | `test_amortization.py` | 19 | Monthly payment, balance, payment count, full calc_amort |
-| `test_portfolio_analytics.py` | 29 | Credit metrics, performance metrics, transition matrix |
-| `test_cashflow_engine.py` | 31 | Pool assumptions, characteristics, cash flows, IRR, price solver |
-| `test_scenario_analysis.py` | 22 | Base assumptions, scenario builder, scenario comparison |
+| `test_portfolio_analytics.py` | 72 | Credit metrics, performance metrics, transition matrix, 7-state transitions, late sub-states |
+| `test_cashflow_engine.py` | 48 | Pool assumptions, characteristics, cash flows, IRR, price solver, state-transition engine |
+| `test_scenario_analysis.py` | 35 | Base assumptions, scenario builder, scenario comparison, transition scenarios |
 
 All tests use synthetic data fixtures and run independently of the database.
 
@@ -117,7 +117,7 @@ The dashboard is a single-page Streamlit app with a sidebar for filters and thre
 
 ### Sidebar Controls
 
-The sidebar contains four controls that affect all three tabs:
+The sidebar contains two controls that affect all three tabs:
 
 #### Strata Type Dropdown
 
@@ -138,29 +138,7 @@ After selecting a Strata Type, this dropdown populates with all available values
 
 When Strata Type is set to "ALL", this dropdown is disabled.
 
-#### Purchase Price Slider
-
-Sets the purchase price as a fraction of UPB (unpaid principal balance):
-
-- **Range**: 0.50 to 1.20
-- **Default**: 0.95 (95 cents on the dollar)
-- **Step**: 0.01
-
-This controls the initial outlay in IRR calculations (Tab 2) and scenario analysis (Tab 3). A value of 0.95 means the investor pays $95 for every $100 of outstanding principal.
-
-#### Stress / Upside % Slider
-
-Controls the multiplicative shift applied to CDR and CPR for stress and upside scenarios:
-
-- **Range**: 0.05 to 0.50
-- **Default**: 0.15 (15%)
-- **Step**: 0.01
-
-A value of 0.15 means:
-- Stress CDR = Base CDR x 1.15 (15% higher defaults)
-- Stress CPR = Base CPR x 0.85 (15% lower prepayments)
-- Upside CDR = Base CDR x 0.85 (15% lower defaults)
-- Upside CPR = Base CPR x 1.15 (15% higher prepayments)
+Purchase Price and Stress/Upside % controls live on their respective tabs (Tab 2 and Tab 3).
 
 #### Sidebar Summary
 
@@ -240,9 +218,7 @@ A table with one row per vintage quarter, showing historical performance:
 | `pct_charged_off` | % of loans charged off |
 | `pct_defaulted_count` | Default rate by count |
 | `pct_defaulted_upb` | Default rate by UPB |
-| `pool_cpr_active` | CPR for all active loans |
-| `pool_cpr_current` | CPR for Current loans only |
-| `pct_prepaid_active` | % of active loans that prepaid |
+| `pool_cpr` | CPR for active loans (Current + In Grace + Late) |
 | `loss_severity` | Loss severity for charged-off loans |
 | `recovery_rate` | Recovery rate (= 1 - loss severity) |
 
@@ -268,24 +244,32 @@ Shows the probability of loans moving between delinquency states:
 | `from_late31_still_in_late31` | % of Late (31-120) loans still in same bucket |
 | `from_late31_charged_off` | % of Late (31-120) loans charged off |
 
+#### Age-Weighted Transition Matrix
+
+Displays 7-state transition probabilities at individual monthly loan ages. The 7 states are: Current, Delinquent (0-30), Late_1, Late_2, Late_3, Charged Off, Fully Paid. The Late (31-120) bucket is split into 3 sub-states representing the delinquency pipeline.
+
+Shown as an observation-weighted average heatmap with an expandable raw monthly probability table. These probabilities are the same ones used by the state-transition cash flow model in Tabs 2 and 3.
+
 ---
 
 ### Tab 2: Cash Flow Projection
 
-This tab projects monthly cash flows for the filtered pool and computes investment returns.
+This tab projects monthly cash flows using the state-transition model and computes investment returns.
 
-**Population**: Only Current loans with March 2019 last payment date are used for projections. CDR and loss severity use all loans in the filter for historical rates.
+**Population**: All active loans are used for projections: Current loans with March 2019 last payment date plus all delinquent loans (In Grace Period + Late 16-30 + Late 31-120) regardless of last payment date. CDR and loss severity use all loans in the filter for historical rates.
 
 #### Base Assumptions (Metric Cards)
 
-Four cards showing the computed base-case assumptions:
+Six cards showing the computed base-case assumptions:
 
 | Metric | Source |
 |--------|--------|
-| CDR | From all loans in filter (Charged Off / total) |
-| CPR | From Current March 2019 loans (pool-level SMM annualized) |
+| CDR (Conditional) | Annualized from trailing 12-month average MDR (all loans in filter) |
+| Avg MDR | Un-annualized monthly default rate |
+| CPR | From active March 2019 loans (pool-level SMM annualized) |
 | Loss Severity | From Charged Off loans with capped recoveries |
 | Recovery Rate | 1 - Loss Severity |
+| Cumulative Default Rate | Raw lifetime rate (reference only, NOT used in projections) |
 
 #### Pool Characteristics (Metric Cards)
 
@@ -293,50 +277,43 @@ Four cards showing the pool being modeled:
 
 | Metric | Definition |
 |--------|-----------|
-| Total UPB | Sum of outstanding principal for Current March 2019 loans |
+| Total UPB | Sum of outstanding principal for active March 2019 loans |
 | WAC | Weighted average coupon (interest rate, weighted by UPB) |
 | WAM | Weighted average remaining maturity (months) |
 | Monthly Payment | Sum of all loan installments |
 
-#### IRR Display
+#### State-Transition Projection
 
-A prominent metric card showing the **Projected IRR** — the annualized internal rate of return at the selected purchase price, using the base-case CDR, CPR, and loss severity.
+**Projection Input**: Purchase Price (%) only. No CDR/CPR inputs — defaults and prepayments are driven entirely by age-specific empirical transition probabilities.
 
-**Example**: At 95 cents on the dollar with CDR=8%, CPR=12%, and loss severity=85%, the IRR might be ~10-15% depending on the pool's WAC.
+**How it works**: The pool is tracked across 7 states (Current, Delinquent (0-30), Late_1, Late_2, Late_3, Charged Off, Fully Paid). Each month, loan balances transition between states based on age-specific probabilities derived from the dataset. Defaults flow through a 5-month pipeline:
 
-#### Price Solver
+```
+Current → Delinquent (0-30) → Late_1 → Late_2 → Late_3 → Charged Off
+```
 
-Next to the IRR display, enter a **Target IRR** (default 12%) and the tool computes the purchase price that would achieve that return.
+**Key consequence**: For an all-Current pool, the first defaults appear at month 5 (not month 1).
 
-**Example**: If you want a 12% IRR, the solver might return 0.9234, meaning you'd need to pay 92.34 cents on the dollar.
+**UPB by State Chart**: A stacked area chart showing the pool balance broken down by state over time. Visualizes the delinquency pipeline progression.
 
-The solver uses Brent's method to search between 50 cents and 150 cents on the dollar. If no price can achieve the target IRR (e.g., target is unrealistically high), it displays "No solution".
+**Price solver**: Uses `solve_price_transition()` — projects cash flows once (price-independent), then solves for price.
 
-#### Projected Pool Balance Chart
+#### IRR Display and Price Solver
 
-A line chart showing the ending balance over time as the pool amortizes, defaults, and prepays. The curve should decline smoothly from total UPB to zero.
-
-**What to look for**:
-- Steeper decline = faster runoff (higher CDR and/or CPR)
-- The x-axis shows dates from April 2019 through the WAM endpoint
-- If the balance reaches zero before WAM, the pool paid off early
+A metric card shows the **Projected IRR**. Next to it, enter a **Target IRR** (default 12%) and the tool computes the purchase price that would achieve that return. The solver searches between 50 and 150 cents on the dollar. If no price can achieve the target, it displays "No solution".
 
 #### Monthly Cash Flow Components Chart
 
-A stacked area chart showing the composition of monthly cash flows:
+A stacked bar chart showing the composition of monthly cash flows, with a toggle to show as % of total:
 
 | Component | Color | Meaning |
 |-----------|-------|---------|
-| Interest | Blue (#636EFA) | Interest earned on performing balance |
-| Scheduled Principal | Orange (#FFA15A) | Regular amortization principal |
-| Prepayments | Green (#00CC96) | Voluntary prepayment principal |
-| Recoveries | Purple (#AB63FA) | Post-default recoveries |
+| Interest | Blue (#4A90D9) | Interest earned on performing balance |
+| Scheduled Principal | Orange (#E67E22) | Regular amortization principal |
+| Prepayments | Green (#2ECC71) | Voluntary prepayment principal |
+| Recoveries | Purple (#9B59B6) | Post-default recoveries |
 
-**What to look for**:
-- Interest starts high and declines as the balance decreases
-- Scheduled principal starts low and increases (standard amortization behavior)
-- Prepayments are relatively constant as a fraction of remaining balance
-- Recoveries are small relative to other components
+An overlay line shows the ending balance on a secondary y-axis (hidden in % mode).
 
 #### Full Cash Flow Table (Expandable)
 
@@ -346,54 +323,37 @@ Click "View Full Cash Flow Table" to see the complete month-by-month projection 
 
 ### Tab 3: Scenario Analysis
 
-This tab compares investment returns under three scenarios: Base, Stress, and Upside.
+This tab compares investment returns under three scenarios: Base, Stress, and Upside. Scenarios shift the state-transition probabilities to model credit deterioration or improvement.
 
-#### Scenario Assumptions Table
+#### Tab 3 Controls
 
-Shows the CDR, CPR, and loss severity for each scenario:
+- **Purchase Price (%)**: Sets the purchase price for scenario IRR calculations (default 95%)
+- **Stress / Upside %**: Slider controlling the multiplicative shift (range 5%-50%, default 15%)
 
-| Scenario | CDR | CPR | Loss Severity |
-|----------|-----|-----|---------------|
-| Base | Historical CDR | Historical CPR | Historical LS |
-| Stress | CDR x (1 + pct) | CPR x (1 - pct) | Same as Base |
-| Upside | CDR x (1 - pct) | CPR x (1 + pct) | Same as Base |
+#### Scenario Construction
 
-Where `pct` is the Stress/Upside % slider value (default 15%).
+Scenarios shift the transition probabilities rather than CDR/CPR:
 
-#### Scenario Comparison Table
+**Stress logic** (per row of the transition matrix):
+- Current→Delinquent probability x (1 + pct) — more delinquency
+- Current→Fully Paid probability x (1 - pct) — less prepayment
+- All cure rates (non-Current → Current) x (1 - pct) — harder to cure
+- Late_3→Charged Off is NOT directly stressed — increases mechanically via re-normalization
+- After multipliers: clamp all probabilities to [0, 1], then adjust residual column to make each row sum to 1
 
-A summary table with one row per scenario:
+**Upside logic**: opposite multipliers.
 
-| Column | Meaning |
-|--------|---------|
-| scenario | Base / Stress / Upside |
-| cdr | Annual default rate used |
-| cpr | Annual prepayment rate used |
-| loss_severity | Loss severity (same for all) |
-| irr | Annualized internal rate of return |
-| total_interest | Sum of all interest cash flows |
-| total_principal | Sum of all principal cash flows |
-| total_losses | Sum of all losses |
-| total_recoveries | Sum of all recoveries |
-| weighted_avg_life | Average years until principal return |
+**Loss severity**: FIXED across all scenarios.
 
-**Expected ordering**: Stress IRR < Base IRR < Upside IRR.
+**Scenario Comparison Table**: One row per scenario with columns for loss severity, IRR, total interest/principal/losses/recoveries/defaults, and WAL.
 
-#### IRR by Scenario Bar Chart
+**Projected Balance by Scenario**: Multi-line chart showing the pool balance over time for each scenario.
 
-A color-coded bar chart showing IRR for each scenario:
-- **Base**: Blue (#636EFA)
-- **Stress**: Red (#EF553B)
-- **Upside**: Green (#00CC96)
+#### Expected Ordering
+
+**Stress IRR < Base IRR < Upside IRR** — higher defaults always hurt returns.
 
 The height difference between Stress and Base shows downside risk. The difference between Upside and Base shows potential upside.
-
-#### Projected Balance by Scenario Chart
-
-Three overlaid line charts showing the pool balance over time under each scenario:
-- **Stress**: Slowest decline (fewer prepayments keep balance higher despite more defaults)
-- **Base**: Middle
-- **Upside**: Fastest decline (more prepayments accelerate runoff)
 
 ---
 
@@ -404,9 +364,9 @@ Three overlaid line charts showing the pool balance over time under each scenari
 | Module | Functions | Purpose |
 |--------|-----------|---------|
 | `amortization.py` | `calc_amort`, `calc_monthly_payment`, `calc_balance`, `calc_payment_num` | Loan-level amortization calculations. Adds ~20 runtime columns to the DataFrame. |
-| `portfolio_analytics.py` | `calculate_credit_metrics`, `calculate_performance_metrics`, `calculate_transition_matrix` | Pool stratification, vintage performance, delinquency transition flows. |
-| `cashflow_engine.py` | `compute_pool_assumptions`, `compute_pool_characteristics`, `project_cashflows`, `calculate_irr`, `solve_price` | Pool-level cash flow projection engine with IRR and price solver. |
-| `scenario_analysis.py` | `compute_base_assumptions`, `build_scenarios`, `compare_scenarios` | Base/stress/upside scenario builder and comparison. |
+| `portfolio_analytics.py` | `calculate_credit_metrics`, `calculate_performance_metrics`, `calculate_transition_matrix`, `reconstruct_loan_timeline`, `get_loan_status_at_age`, `compute_age_transition_probabilities`, `compute_pool_transition_matrix`, `compute_default_timing`, `compute_loan_age_status_matrix` | Pool stratification, vintage performance, delinquency transition flows, age-specific transition probabilities (5-state and 7-state). |
+| `cashflow_engine.py` | `compute_pool_assumptions`, `compute_pool_characteristics`, `calculate_irr`, `build_pool_state`, `project_cashflows_transition`, `solve_price_transition` | Pool-level cash flow projection engine (state-transition model), IRR, and price solver. Also contains `project_cashflows` and `solve_price` (flat CDR/CPR model, available but not used in dashboard). |
+| `scenario_analysis.py` | `compute_base_assumptions`, `build_scenarios_transition`, `compare_scenarios_transition` | Base/stress/upside scenario builder using transition probability shifts. Also contains `build_scenarios` and `compare_scenarios` (flat CDR/CPR model, available but not used in dashboard). |
 
 ### Data Pipeline
 
@@ -415,23 +375,26 @@ Raw CSV → export_to_sqlite.py → loans.db → app.py (load_data) → calc_amo
                                                                       ↓
                                               Sidebar filters → df_filtered
                                                                       ↓
-                                              ┌─────────────────────────────────┐
-                                              │ Tab 1: Portfolio Analytics      │
-                                              │   calculate_credit_metrics()    │
-                                              │   calculate_performance_metrics()│
-                                              │   calculate_transition_matrix() │
-                                              ├─────────────────────────────────┤
-                                              │ Tab 2: Cash Flow Projection     │
-                                              │   compute_pool_assumptions()    │
-                                              │   compute_pool_characteristics()│
-                                              │   project_cashflows()           │
-                                              │   calculate_irr()               │
-                                              │   solve_price()                 │
-                                              ├─────────────────────────────────┤
-                                              │ Tab 3: Scenario Analysis        │
-                                              │   build_scenarios()             │
-                                              │   compare_scenarios()           │
-                                              └─────────────────────────────────┘
+                                              ┌──────────────────────────────────────────┐
+                                              │ Tab 1: Portfolio Analytics               │
+                                              │   calculate_credit_metrics()             │
+                                              │   calculate_performance_metrics()        │
+                                              │   calculate_transition_matrix()          │
+                                              │   compute_age_transition_probabilities() │
+                                              │     (7-state, monthly ages)              │
+                                              ├──────────────────────────────────────────┤
+                                              │ Tab 2: Cash Flow Projection              │
+                                              │   compute_pool_assumptions()             │
+                                              │   compute_pool_characteristics()         │
+                                              │   build_pool_state()                     │
+                                              │   project_cashflows_transition()         │
+                                              │   solve_price_transition()               │
+                                              │   calculate_irr()                        │
+                                              ├──────────────────────────────────────────┤
+                                              │ Tab 3: Scenario Analysis                 │
+                                              │   build_scenarios_transition()           │
+                                              │   compare_scenarios_transition()         │
+                                              └──────────────────────────────────────────┘
 ```
 
 ### Population Splits
@@ -441,7 +404,7 @@ Understanding which loans feed into which calculations is critical:
 - **Tab 1** uses ALL loans matching the sidebar filter
 - **Tabs 2 & 3** use two populations:
   - **CDR and Loss Severity**: ALL loans in the filter (need Charged Off loans)
-  - **CPR, Pool Characteristics, Cash Flows**: Current loans with `last_pymnt_d = 2019-03-01` only
+  - **CPR, Pool Characteristics, Cash Flows**: Active loans — Current with `last_pymnt_d = 2019-03-01` plus all delinquent (In Grace + Late) regardless of last payment date
 
 ---
 
@@ -484,11 +447,11 @@ Understanding which loans feed into which calculations is critical:
 
 ## 8. Troubleshooting
 
-### "No Current loans with March 2019 payment date"
+### "No active loans with March 2019 payment date"
 
-This warning appears on Tabs 2 and 3 when the filtered pool has no Current loans with a March 2019 last payment. This happens for:
+This warning appears on Tabs 2 and 3 when the filtered pool has no active loans (Current + In Grace + Late) with a March 2019 last payment. This happens for:
 - Very old vintages (e.g., 2007-2010) where most loans have already paid off or charged off
-- Filters that exclude all Current loans
+- Filters that exclude all active loans
 
 **Fix**: Select a more recent vintage or broader filter.
 

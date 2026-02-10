@@ -244,18 +244,19 @@ with tab2:
 
     # Separate populations
     df_all_filtered = df_filtered  # all loans for CDR
-    df_current_march = df_filtered[
-        (df_filtered['loan_status'] == 'Current') &
-        (df_filtered['last_pymnt_d'] == '2019-03-01')
+    non_current_active = ['In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+    df_active_march = df_filtered[
+        ((df_filtered['loan_status'] == 'Current') & (df_filtered['last_pymnt_d'] == '2019-03-01'))
+        | (df_filtered['loan_status'].isin(non_current_active))
     ]
 
-    if len(df_current_march) == 0:
-        st.warning("No Current loans with March 2019 payment in this selection.")
+    if len(df_active_march) == 0:
+        st.warning("No active loans with March 2019 payment date in this selection.")
         st.stop()
 
     # Compute historical assumptions
-    pool_assumptions = compute_pool_assumptions(df_all_filtered, df_current_march)
-    pool_chars = compute_pool_characteristics(df_current_march)
+    pool_assumptions = compute_pool_assumptions(df_all_filtered, df_active_march)
+    pool_chars = compute_pool_characteristics(df_active_march)
 
     # User-adjustable inputs (all in percentage format, converted to decimal internally)
     i1, i2, i3 = st.columns(3)
@@ -441,12 +442,13 @@ if len(df_filtered) == 0:
     st.stop()
 
 # Before cash flow projection
-df_current_march = df_filtered[
-    (df_filtered['loan_status'] == 'Current') &
-    (df_filtered['last_pymnt_d'] == '2019-03-01')
+non_current_active = ['In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+df_active_march = df_filtered[
+    ((df_filtered['loan_status'] == 'Current') & (df_filtered['last_pymnt_d'] == '2019-03-01'))
+    | (df_filtered['loan_status'].isin(non_current_active))
 ]
-if len(df_current_march) == 0:
-    st.warning("No Current loans with March 2019 payment date in this selection. "
+if len(df_active_march) == 0:
+    st.warning("No active loans with March 2019 payment date in this selection. "
                "Cash flow projections require active loans.")
     st.stop()
 

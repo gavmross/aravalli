@@ -302,12 +302,16 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ### Cash Flow Projection Population
 
-The cash flow projection engine (Tabs 2 and 3 of the dashboard) operates on **Current loans with `last_pymnt_d = 2019-03-01`** only.
+The cash flow projection engine (Tabs 2 and 3 of the dashboard) operates on **all active loans**: Current loans with `last_pymnt_d = 2019-03-01` plus all delinquent loans (In Grace Period + Late 16-30 + Late 31-120) regardless of last payment date.
 
 | Metric | Value |
 |--------|------:|
-| March 2019 Current loans | 821,602 |
-| Total outstanding UPB | $8,576,562,742 |
+| Current (March 2019 last payment) | 821,602 |
+| In Grace Period (all) | 8,329 |
+| Late (16-30 days) (all) | 4,314 |
+| Late (31-120 days) (all) | 21,339 |
+| **Total active loans** | **855,584** |
+| **Total outstanding UPB** | **$8,959,326,774** |
 
 ### Engineered Columns Summary
 

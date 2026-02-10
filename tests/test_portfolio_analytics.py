@@ -16,6 +16,7 @@ from src.portfolio_analytics import (
     compute_pool_transition_matrix,
     compute_default_timing,
     compute_loan_age_status_matrix,
+    TRANSITION_STATES_7,
 )
 
 
@@ -166,7 +167,7 @@ class TestCalculatePerformanceMetrics:
             'vintage', 'orig_loan_count', 'orig_upb_mm',
             'pct_active', 'pct_current', 'pct_fully_paid', 'pct_charged_off',
             'pct_defaulted_count', 'pct_defaulted_upb',
-            'pool_cpr_active', 'pool_cpr_current', 'pct_prepaid_current',
+            'pool_cpr', 'pct_prepaid',
             'loss_severity', 'recovery_rate'
         ]
         for col in expected:
@@ -210,8 +211,7 @@ class TestCalculatePerformanceMetrics:
         """CPR values should be non-negative."""
         result = calculate_performance_metrics(synthetic_loan_df, verbose=False)
         for _, row in result.iterrows():
-            assert row['pool_cpr_active'] >= 0
-            assert row['pool_cpr_current'] >= 0
+            assert row['pool_cpr'] >= 0
 
 
 class TestCalculateTransitionMatrix:
@@ -739,3 +739,208 @@ class TestComputeLoanAgeStatusMatrix:
         result = compute_loan_age_status_matrix(df, bucket_size=6)
 
         assert result['total_loans'].sum() == len(df)
+
+
+# ===========================================================================
+# Tests for 7-STATE model extensions
+# ===========================================================================
+
+class TestReconstructLoanTimelineLateSubStates:
+    """Test Late sub-state columns added by reconstruct_loan_timeline."""
+
+    def test_late_sub_state_columns_exist(self, timeline_loan_df):
+        """Should add late_1/2/3_month and late_1/2/3_age columns."""
+        result = reconstruct_loan_timeline(timeline_loan_df)
+        for col in ['late_1_month', 'late_2_month', 'late_3_month',
+                     'late_1_age', 'late_2_age', 'late_3_age']:
+            assert col in result.columns, f"Missing column: {col}"
+
+    def test_charged_off_loan_late_sub_states(self, timeline_loan_df):
+        """Charged Off loan 3: late_1 = late_31_120, late_2 = +1mo, late_3 = +2mo."""
+        result = reconstruct_loan_timeline(timeline_loan_df)
+        loan = result[result['id'] == 3].iloc[0]
+
+        # late_31_120_month = 2018-12-01 (delinquent + 1 month)
+        assert loan['late_1_month'] == loan['late_31_120_month']
+        assert loan['late_2_month'] == loan['late_31_120_month'] + pd.DateOffset(months=1)
+        assert loan['late_3_month'] == loan['late_31_120_month'] + pd.DateOffset(months=2)
+
+    def test_late_sub_state_ages_computed(self, timeline_loan_df):
+        """Late sub-state ages should be consecutive months."""
+        result = reconstruct_loan_timeline(timeline_loan_df)
+        loan = result[result['id'] == 3].iloc[0]
+
+        # Ages should be roughly consecutive
+        assert not np.isnan(loan['late_1_age'])
+        assert not np.isnan(loan['late_2_age'])
+        assert not np.isnan(loan['late_3_age'])
+        assert abs(loan['late_2_age'] - loan['late_1_age'] - 1) <= 1
+        assert abs(loan['late_3_age'] - loan['late_2_age'] - 1) <= 1
+
+    def test_current_loan_no_late_sub_states(self, timeline_loan_df):
+        """Current loan should have NaT/NaN for all late sub-state columns."""
+        result = reconstruct_loan_timeline(timeline_loan_df)
+        loan = result[result['id'] == 1].iloc[0]
+
+        assert pd.isna(loan['late_1_month'])
+        assert pd.isna(loan['late_2_month'])
+        assert pd.isna(loan['late_3_month'])
+        assert np.isnan(loan['late_1_age'])
+
+    def test_late_31_120_loan_has_sub_states(self, timeline_loan_df):
+        """Late (31-120 days) loan 5 should have late sub-state months set."""
+        result = reconstruct_loan_timeline(timeline_loan_df)
+        loan = result[result['id'] == 5].iloc[0]
+
+        # Loan 5 is Late (31-120 days) → it reached late_31_120
+        assert pd.notna(loan['late_1_month'])
+
+
+class TestGetLoanStatusAtAge7State:
+    """Test 7-state status determination."""
+
+    def test_charged_off_loan_7state_pipeline(self, timeline_loan_df):
+        """Charged Off loan should show Late_1/Late_2/Late_3 at correct ages."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        loan_3 = df[df['id'] == 3]
+
+        late_1_age = int(loan_3.iloc[0]['late_1_age'])
+        late_2_age = int(loan_3.iloc[0]['late_2_age'])
+        late_3_age = int(loan_3.iloc[0]['late_3_age'])
+        default_age = int(loan_3.iloc[0]['default_age'])
+
+        status_l1 = get_loan_status_at_age(loan_3, late_1_age, states='7state')
+        assert status_l1.iloc[0] == 'Late_1'
+
+        status_l2 = get_loan_status_at_age(loan_3, late_2_age, states='7state')
+        assert status_l2.iloc[0] == 'Late_2'
+
+        status_l3 = get_loan_status_at_age(loan_3, late_3_age, states='7state')
+        assert status_l3.iloc[0] == 'Late_3'
+
+        status_co = get_loan_status_at_age(loan_3, default_age, states='7state')
+        assert status_co.iloc[0] == 'Charged Off'
+
+    def test_delinquent_only_at_exact_age(self, timeline_loan_df):
+        """In 7-state, Delinquent (0-30) should only appear at exactly delinquent_age."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        loan_3 = df[df['id'] == 3]
+
+        delinq_age = int(loan_3.iloc[0]['delinquent_age'])
+
+        # At delinquent_age: Delinquent
+        status = get_loan_status_at_age(loan_3, delinq_age, states='7state')
+        assert status.iloc[0] == 'Delinquent (0-30)'
+
+        # One month before: Current
+        if delinq_age > 0:
+            status_before = get_loan_status_at_age(
+                loan_3, delinq_age - 1, states='7state')
+            assert status_before.iloc[0] == 'Current'
+
+    def test_5state_backward_compat(self, timeline_loan_df):
+        """states='5state' should produce same results as original function."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        loan_3 = df[df['id'] == 3]
+
+        delinq_age = int(loan_3.iloc[0]['delinquent_age'])
+        status_5 = get_loan_status_at_age(loan_3, delinq_age, states='5state')
+        assert status_5.iloc[0] == 'Delinquent (0-30)'
+
+    def test_current_stays_current_7state(self, timeline_loan_df):
+        """Current loan should be Current at all valid ages in 7-state."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        loan_1 = df[df['id'] == 1]
+
+        for age in [0, 5, 10, 15, 20]:
+            status = get_loan_status_at_age(loan_1, age, states='7state')
+            assert status.iloc[0] == 'Current', f"Expected Current at age {age}"
+
+
+class TestComputeAgeTransitionProbabilities7State:
+    """Test 7-state age-bucketed transition probabilities."""
+
+    def test_7state_columns(self, timeline_loan_df):
+        """7-state output should have all 7-state pct columns."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result = compute_age_transition_probabilities(
+            df, bucket_size=1, states='7state')
+
+        expected_cols = [
+            'to_current_pct', 'to_delinquent_0_30_pct',
+            'to_late_1_pct', 'to_late_2_pct', 'to_late_3_pct',
+            'to_charged_off_pct', 'to_fully_paid_pct',
+        ]
+        for col in expected_cols:
+            assert col in result.columns, f"Missing column: {col}"
+
+    def test_7state_row_sums_to_one(self, timeline_loan_df):
+        """Each row of 7-state probabilities should sum to ~1.0."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result = compute_age_transition_probabilities(
+            df, bucket_size=1, states='7state')
+
+        pct_cols = [
+            'to_current_pct', 'to_delinquent_0_30_pct',
+            'to_late_1_pct', 'to_late_2_pct', 'to_late_3_pct',
+            'to_charged_off_pct', 'to_fully_paid_pct',
+        ]
+        for _, row in result.iterrows():
+            total = sum(row[c] for c in pct_cols)
+            assert abs(total - 1.0) < 0.01, (
+                f"Row sums to {total} for bucket={row['age_bucket']}, "
+                f"from={row['from_status']}"
+            )
+
+    def test_7state_no_skip(self, timeline_loan_df):
+        """Current → Late_1/Late_2/Late_3/Charged Off should be 0%."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result = compute_age_transition_probabilities(
+            df, bucket_size=1, states='7state')
+
+        current_rows = result[result['from_status'] == 'Current']
+        for _, row in current_rows.iterrows():
+            assert row['to_late_1_pct'] == 0.0, (
+                f"Current→Late_1 = {row['to_late_1_pct']} at age {row['age_bucket']}")
+            assert row['to_late_2_pct'] == 0.0
+            assert row['to_late_3_pct'] == 0.0
+            assert row['to_charged_off_pct'] == 0.0
+
+    def test_7state_absorbing_states(self, timeline_loan_df):
+        """Charged Off and Fully Paid should stay at 100% in 7-state."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result = compute_age_transition_probabilities(
+            df, bucket_size=6, states='7state')
+
+        co_rows = result[result['from_status'] == 'Charged Off']
+        for _, row in co_rows.iterrows():
+            assert abs(row['to_charged_off_pct'] - 1.0) < 0.01
+
+        fp_rows = result[result['from_status'] == 'Fully Paid']
+        for _, row in fp_rows.iterrows():
+            assert abs(row['to_fully_paid_pct'] - 1.0) < 0.01
+
+    def test_monthly_ages_more_granular(self, timeline_loan_df):
+        """bucket_size=1 should produce more age buckets than bucket_size=6."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result_monthly = compute_age_transition_probabilities(
+            df, bucket_size=1, states='7state')
+        result_6mo = compute_age_transition_probabilities(
+            df, bucket_size=6, states='7state')
+
+        monthly_buckets = result_monthly['age_bucket'].nunique()
+        six_mo_buckets = result_6mo['age_bucket'].nunique()
+        assert monthly_buckets >= six_mo_buckets
+
+    def test_5state_backward_compat(self, timeline_loan_df):
+        """states='5state' should produce same columns as original."""
+        df = reconstruct_loan_timeline(timeline_loan_df)
+        result = compute_age_transition_probabilities(
+            df, bucket_size=6, states='5state')
+
+        expected_cols = [
+            'to_current_pct', 'to_delinquent_0_30_pct',
+            'to_late_31_120_pct', 'to_charged_off_pct', 'to_fully_paid_pct',
+        ]
+        for col in expected_cols:
+            assert col in result.columns

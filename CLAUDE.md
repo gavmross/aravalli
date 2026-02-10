@@ -176,7 +176,7 @@ This is a single point-in-time snapshot (March 2019). No monthly servicing tapes
 
 Key constraints: Current cannot skip to Charged Off or Late (31-120). Late (31-120) cannot cure. Charged Off and Fully Paid are terminal.
 
-These reconstructed transitions are for display/analysis in Tab 1 only. The cash flow engine uses a constant annualized CDR.
+These reconstructed transitions are used in Tab 1 for display and as the basis for age-specific transition probabilities in the state-transition cash flow model (Tabs 2 and 3).
 
 ---
 
@@ -199,26 +199,38 @@ Extracted from `scripts/analysis.ipynb`. Do not modify logic — only imports.
 
 These are display-only, do NOT feed into the cash flow engine. They use only base DB columns (no calc_amort dependency).
 
-- `reconstruct_loan_timeline(df) → pd.DataFrame` — Adds 12 columns: loan_age_months (capped at term_months), age_bucket, age_bucket_label, delinquent_month, late_31_120_month, default_month, payoff_month, delinquent_age, late_31_120_age, default_age, payoff_age, cured_from_late
-- `get_loan_status_at_age(df, age) → pd.Series` — Vectorized status at a specific loan age. Priority: Charged Off > Fully Paid > Late (31-120) > Delinquent (0-30) > Current. Returns None for loans not yet at given age.
-- `compute_age_transition_probabilities(df, bucket_size=6) → pd.DataFrame` — Empirical transition probabilities per 6-month age bucket. Returns age_bucket, from_status, to_*_pct columns, observation_count.
+- `reconstruct_loan_timeline(df) → pd.DataFrame` — Adds 18 columns: loan_age_months, age_bucket, age_bucket_label, delinquent_month, late_31_120_month, default_month, payoff_month, delinquent_age, late_31_120_age, default_age, payoff_age, cured_from_late, late_1_month, late_2_month, late_3_month, late_1_age, late_2_age, late_3_age. Late sub-states computed from late_31_120_month: Late_1 = same, Late_2 = +1mo, Late_3 = +2mo.
+- `get_loan_status_at_age(df, age, states='5state') → pd.Series` — Vectorized status at a specific loan age. In 5-state mode: Charged Off > Fully Paid > Late (31-120) > Delinquent (0-30) > Current. In 7-state mode: Charged Off > Fully Paid > Late_3 > Late_2 > Late_1 > Delinquent (0-30) > Current. Delinquent only at exact delinquent_age in 7-state mode.
+- `compute_age_transition_probabilities(df, bucket_size=6, states='5state') → pd.DataFrame` — Empirical transition probabilities. In 5-state mode: per 6-month age bucket with 5 to_*_pct columns. In 7-state mode: supports bucket_size=1 (individual monthly ages) with 7 to_*_pct columns. Returns age_bucket, from_status, to_*_pct columns, observation_count.
+- `TRANSITION_STATES_7` — Constant: `['Current', 'Delinquent (0-30)', 'Late_1', 'Late_2', 'Late_3', 'Charged Off', 'Fully Paid']`
 - `compute_pool_transition_matrix(df_current, age_probs) → dict` — Dollar-flow matrix from age-specific probabilities applied to current pool UPB. Returns aggregate_matrix, aggregate_matrix_pct, breakdown_by_age.
 - `compute_default_timing(df, group_col=None) → pd.DataFrame` — Default timing distribution by loan age. Returns default_age_months, loan_count, upb_amount, pct_of_defaults, cumulative_pct.
 - `compute_loan_age_status_matrix(df, bucket_size=6) → pd.DataFrame` — Cross-sectional status distribution at each age bucket. Returns age_bucket, total_loans, total_upb, pct_current, pct_fully_paid, pct_charged_off, pct_late_grace.
 
 ### Cash Flow Functions (in `src/cashflow_engine.py`)
 
-- `compute_pool_assumptions(df_all, df_current) → dict` — Base-case CDR (conditional, 12-month trailing average MDR, annualized via dv01 methodology), CPR, loss severity. Requires `reconstruct_loan_timeline()` to have been called on `df_all` first (for `default_month` and `payoff_month` columns). Returns `{'cdr': float, 'cumulative_default_rate': float, 'avg_mdr': float, 'monthly_mdrs': list[float], 'cpr': float, 'loss_severity': float, 'recovery_rate': float}`. Where: `cdr` = conditional CDR (PRIMARY, used in cash flow projections); `cumulative_default_rate` = raw lifetime rate (display/reference only, NOT called CDR); `avg_mdr` = average monthly default rate (un-annualized, for display); `monthly_mdrs` = list of 12 individual monthly MDRs (for display, shows trend/volatility); `cpr` = single-month CPR from calc_amort (UNCHANGED); `loss_severity`, `recovery_rate` = unchanged.
-- `compute_pool_characteristics(df_current) → dict` — Pool aggregates: {total_upb, wac, wam, monthly_payment}.
-- `project_cashflows(pool_chars, cdr, cpr, loss_severity, purchase_price) → pd.DataFrame` — Monthly projection loop. Returns month, date, beginning_balance, defaults, loss, recovery, interest, scheduled_principal, prepayments, total_principal, ending_balance, total_cashflow.
+**Dashboard-active (used by `app.py`)**:
+- `compute_pool_assumptions(df_all, df_active) → dict` — Base-case CDR (conditional, 12-month trailing average MDR, annualized via dv01 methodology), CPR, loss severity. Requires `reconstruct_loan_timeline()` to have been called on `df_all` first (for `default_month` and `payoff_month` columns). Returns `{'cdr': float, 'cumulative_default_rate': float, 'avg_mdr': float, 'monthly_mdrs': list[float], 'cpr': float, 'loss_severity': float, 'recovery_rate': float}`.
+- `compute_pool_characteristics(df_active) → dict` — Pool aggregates: {total_upb, wac, wam, monthly_payment}.
 - `calculate_irr(cashflows_df, pool_chars, purchase_price) → float` — Annualized IRR from projected cash flows.
-- `solve_price(pool_chars, target_irr, cdr, cpr, loss_severity) → float` — Brentq solver for purchase price at target IRR. Bounds [0.50, 1.50].
+- `build_pool_state(df, include_statuses=None) → dict` — Constructs initial pool state from loan DataFrame for state-transition model. Maps LC statuses to 7 model states. Returns `{'states': {state: {age: upb}}, 'total_upb', 'wac', 'wam', 'monthly_payment'}`.
+- `project_cashflows_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months) → pd.DataFrame` — State-transition monthly projection. Tracks UPB across 7 states with age-specific transition probabilities. Returns columns compatible with `calculate_irr()` plus state-specific UPB columns.
+- `solve_price_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months, target_irr) → float|None` — Brentq solver for transition model. Projects once (price-independent), then solves for price.
+
+**Codebase-only (not used by dashboard, retained for reference/testing)**:
+- `project_cashflows(pool_chars, cdr, cpr, loss_severity, purchase_price) → pd.DataFrame` — Flat CDR/CPR monthly projection loop.
+- `solve_price(pool_chars, target_irr, cdr, cpr, loss_severity) → float` — Brentq solver for flat model.
 
 ### Scenario Functions (in `src/scenario_analysis.py`)
 
-- `compute_base_assumptions(df_all, df_current) → dict` — Wrapper for compute_pool_assumptions.
-- `build_scenarios(base_assumptions, stress_pct=0.15, upside_pct=0.15) → dict` — Multiplicative shifts. Stress: CDR×(1+pct), CPR×(1-pct). Upside: CDR×(1-pct), CPR×(1+pct). Loss severity FIXED.
-- `compare_scenarios(pool_chars, scenarios, purchase_price) → pd.DataFrame` — Runs projections + IRR for each scenario.
+**Dashboard-active**:
+- `compute_base_assumptions(df_all, df_active) → dict` — Wrapper for compute_pool_assumptions.
+- `build_scenarios_transition(base_probs, stress_pct=0.15, upside_pct=0.15) → dict` — Applies multiplicative shifts to transition probabilities. Stress: increases delinquency, decreases cure rates. Late_3→Default NOT directly stressed. Returns `{'Base', 'Stress', 'Upside'}` probability DataFrames.
+- `compare_scenarios_transition(pool_state, scenario_probs, loss_severity, recovery_rate, pool_chars, num_months, purchase_price) → pd.DataFrame` — Runs transition projections + IRR for each scenario.
+
+**Codebase-only (not used by dashboard, retained for reference/testing)**:
+- `build_scenarios(base_assumptions, stress_pct=0.15, upside_pct=0.15) → dict` — Multiplicative CDR/CPR shifts for flat model.
+- `compare_scenarios(pool_chars, scenarios, purchase_price) → pd.DataFrame` — Runs flat projections + IRR for each scenario.
 
 ---
 
@@ -233,7 +245,7 @@ Single page with sidebar + 3 tabs.
 1. **Strata Type** dropdown: grade, term_months, purpose, addr_state, issue_quarter, or ALL
 2. **Strata Value** dropdown: populated dynamically. Disabled if ALL.
 
-Purchase Price, CDR/CPR overrides, and Stress/Upside % controls live on their respective tabs (Tab 2 and Tab 3).
+Purchase Price and Stress/Upside % controls live on their respective tabs (Tab 2 and Tab 3).
 
 ### Display Format
 All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%, 8.73%). Stored internally as decimals.
@@ -241,31 +253,27 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 ### Data Flow
 1. User selects strata → query SQLite
 2. Run `calc_amort()` on filtered data
-3. Tab 1 uses ALL loans; Tabs 2 & 3 use ONLY Current loans with `last_pymnt_d == 2019-03-01`
-4. CDR from ALL loans; CPR from Current March 2019 only; Loss severity from Charged Off subset
-5. Tab 2 allows CDR/CPR/price overrides; Tab 3 has own price + stress/upside %
+3. Tab 1 uses ALL loans; Tabs 2 & 3 use all active loans: Current with `last_pymnt_d == 2019-03-01` plus all delinquent (In Grace + Late 16-30 + Late 31-120 regardless of last payment date)
+4. CDR from ALL loans; CPR from active March 2019 loans; Loss severity from Charged Off subset
+5. Tab 2 has purchase price input; Tab 3 has own price + stress/upside % slider
 
 ### Tab 1: Portfolio Metrics
 - Credit metrics, performance metrics, transition matrix tables (existing functions)
-- Age-Weighted Transition Matrix: heatmap + age bucket breakdown table
+- Age-Weighted Transition Matrix: 7-state observation-weighted average heatmap + expandable raw monthly probabilities
 - Default Timing Curve: histogram + cumulative line (dual axis)
-- Loan Age Status Distribution: stacked bar with toggles (monthly/6-month, count/UPB)
+- Loan Age Status Distribution: stacked bar showing UPB by loan status at each monthly loan age
 
-### Tab 2: Cash Flow Projection
-- Show computed base assumptions as metric cards:
-  - **CDR (Conditional, 12mo trailing)**: the annualized rate driving projections
-  - **Cumulative Default Rate**: raw lifetime rate — shown in smaller text or tooltip as reference (do NOT label as "CDR")
-  - **Avg MDR**: un-annualized monthly default rate for transparency
-  - **CPR**: single-month from calc_amort (unchanged)
-  - **Loss Severity** and **Recovery Rate**: unchanged
+### Tab 2: Cash Flow Projection (State-Transition)
+- Computed base assumptions as metric cards (CDR, Avg MDR, CPR, Loss Severity, Recovery Rate, Cumulative Default Rate)
 - Pool characteristics as metric cards
-- User inputs: Purchase Price (%), CDR (%), CPR (%)
-- IRR display, "Solve for Price" input
-- Balance chart, stacked area chart, expandable monthly table
+- Purchase Price (%) input only — no CDR/CPR inputs (driven by transition probabilities)
+- Uses `build_pool_state()` + `project_cashflows_transition()` + `solve_price_transition()`
+- UPB-by-state stacked area chart, IRR display, price solver, monthly cash flow chart, expandable monthly table
 
-### Tab 3: Scenario Comparison
+### Tab 3: Scenario Comparison (State-Transition)
 - Own Purchase Price (%), Stress/Upside % slider
-- Scenario assumption table, IRR summary, bar chart, multi-line balance chart
+- Uses `build_scenarios_transition()` + `compare_scenarios_transition()`
+- Scenario comparison table + multi-line balance chart by scenario
 
 ---
 
@@ -282,7 +290,7 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 
 - `pytest tests/ -v` from project root
 - Test files mirror src modules. See `tests/test_*.py` for all test cases.
-- All 130 tests currently pass (57 portfolio_analytics, 73 other modules).
+- All 174 tests currently pass (72 portfolio_analytics, 48 cashflow_engine, 35 scenario_analysis, 19 amortization).
 - `compute_pool_assumptions` CDR:
   - Create synthetic cohort: 1000 loans originated Jan 2017. In each of the 12 trailing months (Apr 2018 – Mar 2019), 5 loans default each month with $10K exposure each. Performing balance ~$8M/month. Verify avg_MDR ≈ $50K/$8M ≈ 0.625%/month, CDR = 1-(1-0.00625)^12 ≈ 7.24%
   - Zero defaults in all 12 months: all MDRs = 0, CDR = 0
@@ -305,12 +313,15 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - **NEVER rewrite** `calc_amort()`, `calculate_credit_metrics()`, `calculate_performance_metrics()`, or `calculate_transition_matrix()`. Extracted from notebook — do not modify logic.
 - **ALWAYS use sequential-thinking** MCP before implementing financial math.
 - **ALWAYS read the relevant skill file** before writing code in that domain.
-- **Cash flows and scenarios operate on Current loans with March 2019 last payment date ONLY.**
+- **Cash flows and scenarios operate on all active loans**: Current with March 2019 last payment date plus all delinquent (In Grace + Late 16-30 + Late 31-120) regardless of last payment date.
 - **CDR is computed from ALL loans in the cohort** using the dv01 conditional methodology: trailing 12-month average MDR, annualized. Cumulative default rate (NOT called CDR) retained for display only.
 - **`compute_pool_assumptions()` requires `reconstruct_loan_timeline()`** on df_all first (for `default_month` and `payoff_month` columns used in conditional CDR).
-- **CPR from Current March 2019 only.**
-- **Loss severity is FIXED across all three scenarios** — only CDR and CPR shift.
+- **CPR from active March 2019 loans (Current + In Grace + Late).**
+- **Loss severity is FIXED across all three scenarios** — only transition probabilities shift.
 - **All base/stress/upside defaults are cohort-specific**, not global averages.
 - Projection starts at t=0 (March 2019), first payment at t=1 (April 2019).
 - Pool-level aggregate projections only.
 - Virtual environment named `.env`.
+- **State-transition model**: Defaults flow through a 5-month pipeline (Current → Delinquent → Late_1 → Late_2 → Late_3 → Charged Off). All-Current pool has zero defaults for months 1-4.
+- **Transition scenario stress**: Late_3→Charged Off is NOT directly stressed — it increases mechanically via re-normalization when cure rates decrease.
+- **The dashboard uses the state-transition model exclusively.** The Simple (flat CDR/CPR) functions remain in the codebase (`project_cashflows`, `solve_price`, `build_scenarios`, `compare_scenarios`) but are not imported or used by `app.py`.

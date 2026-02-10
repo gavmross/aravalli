@@ -26,16 +26,17 @@ df = calc_amort(df, verbose=False)
 
 # Step 2: Filter to a sample cohort (2018Q1, Grade B, 36-month)
 df_cohort = df[(df['issue_quarter'] == '2018Q1') & (df['grade'] == 'B') & (df['term_months'] == 36)]
-df_current = df_cohort[
-    (df_cohort['loan_status'] == 'Current') &
-    (df_cohort['last_pymnt_d'] == '2019-03-01')
+non_current_active = ['In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+df_active = df_cohort[
+    ((df_cohort['loan_status'] == 'Current') & (df_cohort['last_pymnt_d'] == '2019-03-01'))
+    | (df_cohort['loan_status'].isin(non_current_active))
 ]
 
 print(f"Total loans in cohort: {len(df_cohort):,}")
-print(f"Current (March 2019) loans: {len(df_current):,}")
+print(f"Active loans: {len(df_active):,}")
 
 # Step 3: Compute assumptions
-assumptions = compute_pool_assumptions(df_cohort, df_current)
+assumptions = compute_pool_assumptions(df_cohort, df_active)
 print(f"\nBase Assumptions:")
 print(f"  CDR:           {assumptions['cdr']:.4%}")
 print(f"  CPR:           {assumptions['cpr']:.4%}")
@@ -43,7 +44,7 @@ print(f"  Loss Severity: {assumptions['loss_severity']:.4%}")
 print(f"  Recovery Rate: {assumptions['recovery_rate']:.4%}")
 
 # Step 4: Compute pool characteristics
-pool_chars = compute_pool_characteristics(df_current)
+pool_chars = compute_pool_characteristics(df_active)
 print(f"\nPool Characteristics:")
 print(f"  Total UPB:       ${pool_chars['total_upb']:,.2f}")
 print(f"  WAC:             {pool_chars['wac']:.4%}")
@@ -92,7 +93,7 @@ print(f"\nPrice for 12% IRR: {price_12:.4f}")
 
 ## If the Cohort Is Empty
 
-If 2018Q1 / Grade B / 36-month has no Current March 2019 loans, try these alternatives in order:
+If 2018Q1 / Grade B / 36-month has no active loans, try these alternatives in order:
 1. 2017Q4, Grade B, 36-month
 2. 2018Q1, Grade C, 36-month
 3. 2017Q1, all grades, 36-month

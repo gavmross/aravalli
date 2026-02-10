@@ -19,9 +19,11 @@ from src.amortization import calc_amort
 from src.cashflow_engine import (
     compute_pool_assumptions,
     compute_pool_characteristics,
-    project_cashflows,
     calculate_irr,
-    solve_price,
+    adjust_prepayment_rates,
+    build_pool_state,
+    project_cashflows_transition,
+    solve_price_transition,
 )
 from src.portfolio_analytics import (
     calculate_credit_metrics,
@@ -29,11 +31,14 @@ from src.portfolio_analytics import (
     calculate_transition_matrix,
     reconstruct_loan_timeline,
     compute_age_transition_probabilities,
-    compute_pool_transition_matrix,
     compute_default_timing,
     compute_loan_age_status_matrix,
+    TRANSITION_STATES_7,
 )
-from src.scenario_analysis import build_scenarios, compare_scenarios
+from src.scenario_analysis import (
+    build_scenarios_transition,
+    compare_scenarios_transition,
+)
 from src.transition_viz import render_sankey_diagram
 
 # ---------------------------------------------------------------------------
@@ -45,47 +50,51 @@ st.title("Lending Club Loan Portfolio Investment Analysis")
 # ---------------------------------------------------------------------------
 # Data loading (cached)
 # ---------------------------------------------------------------------------
-@st.cache_data
+@st.cache_resource
 def load_data() -> pd.DataFrame:
     """Load loans.db and run calc_amort to add engineered columns."""
     conn = sqlite3.connect("data/loans.db")
     df = pd.read_sql("SELECT * FROM loans", conn)
     conn.close()
     df = calc_amort(df, verbose=False)
+    # Downcast float64 → float32 to halve memory for numeric columns
+    float64_cols = df.select_dtypes(include=['float64']).columns
+    df[float64_cols] = df[float64_cols].astype('float32')
+    # Downcast int64 → int32
+    int64_cols = df.select_dtypes(include=['int64']).columns
+    df[int64_cols] = df[int64_cols].astype('int32')
+    # Convert low-cardinality object columns to category dtype
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].nunique() < 100:
+            df[col] = df[col].astype('category')
     return df
 
 
-@st.cache_data
-def compute_irr_grid(
-    _pool_chars: dict,
-    cdr_values: tuple,
-    cpr_values: tuple,
-    loss_severity: float,
-    purchase_price: float,
-) -> list:
-    """Compute IRR for each (CDR, CPR) combination. Returns 2D list."""
-    irr_matrix = []
-    for cdr in cdr_values:
-        row = []
-        for cpr in cpr_values:
-            cf = project_cashflows(_pool_chars, cdr, cpr, loss_severity, purchase_price)
-            irr = calculate_irr(cf, _pool_chars, purchase_price)
-            row.append(irr if not (np.isnan(irr) or np.isinf(irr)) else None)
-        irr_matrix.append(row)
-    return irr_matrix
-
-
-@st.cache_data
-def cached_reconstruct_timeline(_df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_resource
+def cached_reconstruct_timeline(_df: pd.DataFrame,
+                                cache_key: str = '') -> pd.DataFrame:
     """Reconstruct loan timelines for backsolve analysis."""
     return reconstruct_loan_timeline(_df)
 
 
-@st.cache_data
-def cached_age_transition_probs(_df: pd.DataFrame, bucket_size: int) -> pd.DataFrame:
+@st.cache_resource
+def cached_age_transition_probs(_df: pd.DataFrame, bucket_size: int,
+                                states: str = '5state',
+                                cache_key: str = '') -> pd.DataFrame:
     """Compute age-bucketed transition probabilities."""
-    return compute_age_transition_probabilities(_df, bucket_size=bucket_size)
+    return compute_age_transition_probabilities(
+        _df, bucket_size=bucket_size, states=states)
 
+
+# ---------------------------------------------------------------------------
+# Cache versioning — bump this when cached data structures change.
+# Clears all stale caches automatically on the first run after a code update.
+# ---------------------------------------------------------------------------
+_CACHE_VERSION = 7
+if st.session_state.get("_cache_version") != _CACHE_VERSION:
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state["_cache_version"] = _CACHE_VERSION
 
 df = load_data()
 
@@ -118,7 +127,11 @@ with st.sidebar:
             options=["ALL"] + [str(v) for v in unique_values],
         )
 
-    # Purchase price and stress/upside controls are on their respective tabs
+    st.markdown("---")
+    st.caption(
+        "State-transition model: defaults flow through a 5-month "
+        "delinquency pipeline with age-specific transition probabilities."
+    )
 
 # ---------------------------------------------------------------------------
 # Apply filters
@@ -132,9 +145,12 @@ if strata_col != "ALL" and strata_value != "ALL":
         filter_val = float(strata_value)
     else:
         filter_val = strata_value
-    df_filtered = df[df[strata_col] == filter_val].copy()
+    df_filtered = df[df[strata_col] == filter_val]
 else:
-    df_filtered = df.copy()
+    df_filtered = df
+
+# Cache key for filter-dependent cached functions
+_filter_key = f"{strata_col}_{strata_value}"
 
 if len(df_filtered) == 0:
     st.warning("No loans match the current filters. Adjust your selections.")
@@ -149,10 +165,17 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Population splits
 # ---------------------------------------------------------------------------
-df_current_march = df_filtered[
-    (df_filtered["loan_status"] == "Current")
-    & (df_filtered["last_pymnt_d"] == "2019-03-01")
-].copy()
+active_statuses = ['Current', 'In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+non_current_active = ['In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
+df_active_march = df_filtered[
+    ((df_filtered["loan_status"] == "Current") & (df_filtered["last_pymnt_d"] == "2019-03-01"))
+    | (df_filtered["loan_status"].isin(non_current_active))
+]
+
+# ---------------------------------------------------------------------------
+# Shared enriched timeline (computed once, used across all tabs)
+# ---------------------------------------------------------------------------
+df_enriched = cached_reconstruct_timeline(df_filtered, cache_key=_filter_key)
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -263,13 +286,10 @@ with tab1:
     )
 
     pm_display = perf_metrics.copy()
-    # Drop pool_cpr_active — only show CPR for Current loans
-    if "pool_cpr_active" in pm_display.columns:
-        pm_display = pm_display.drop(columns=["pool_cpr_active"])
     pm_pct_cols = [
         "pct_active", "pct_current", "pct_fully_paid", "pct_charged_off",
         "pct_defaulted_count", "pct_defaulted_upb",
-        "pool_cpr_current", "pct_prepaid_current", "loss_severity", "recovery_rate",
+        "pool_cpr", "pct_prepaid", "loss_severity", "recovery_rate",
     ]
     for c in pm_pct_cols:
         if c in pm_display.columns:
@@ -288,8 +308,8 @@ with tab1:
         "pct_charged_off": "% Charged Off",
         "pct_defaulted_count": "Loans Defaulted of Originated",
         "pct_defaulted_upb": "UPB Defaulted of OUPB",
-        "pool_cpr_current": "CPR (Current Only)",
-        "pct_prepaid_current": "UPB Prepaid of OUPB",
+        "pool_cpr": "CPR (Active Loans)",
+        "pct_prepaid": "UPB Prepaid of OUPB",
         "loss_severity": "Total Loss Severity",
         "recovery_rate": "Total Recovery Rate",
     })
@@ -325,75 +345,61 @@ with tab1:
     # -------------------------------------------------------------------
     st.markdown("---")
 
-    # Reconstruct loan timelines once for all new visualizations
-    with st.spinner("Reconstructing loan timelines..."):
-        df_enriched = cached_reconstruct_timeline(df_filtered)
-
-    # Current loans with March 2019 payment (with timeline columns)
+    # Active loans: Current with March 2019 payment + all delinquent
     # Note: no .copy() — the enriched df has mixed dtypes that cause
     # pandas consolidation errors on copy; this slice is read-only
-    df_current_march_enriched = df_enriched[
-        (df_enriched["loan_status"] == "Current")
-        & (df_enriched["last_pymnt_d"] == "2019-03-01")
+    df_active_march_enriched = df_enriched[
+        ((df_enriched["loan_status"] == "Current") & (df_enriched["last_pymnt_d"] == "2019-03-01"))
+        | (df_enriched["loan_status"].isin(non_current_active))
     ]
 
-    # ── Age-Weighted Transition Matrix ────────────────────────────────
+    # ── Age-Weighted Transition Matrix (7-State Monthly) ──────────────
     st.subheader("Age-Weighted Transition Matrix")
 
-    with st.spinner("Computing age-bucketed transition probabilities..."):
-        age_probs = cached_age_transition_probs(df_enriched, bucket_size=6)
+    with st.spinner("Computing monthly transition probabilities..."):
+        age_probs = cached_age_transition_probs(
+            df_enriched, bucket_size=1, states='7state',
+            cache_key=_filter_key)
 
-    if len(age_probs) > 0 and len(df_current_march_enriched) > 0:
-        pool_matrix = compute_pool_transition_matrix(
-            df_current_march_enriched, age_probs,
-        )
+    if len(age_probs) > 0 and len(df_active_march_enriched) > 0:
+        state_list = TRANSITION_STATES_7
+        pct_cols_7 = [
+            'to_current_pct', 'to_delinquent_0_30_pct',
+            'to_late_1_pct', 'to_late_2_pct', 'to_late_3_pct',
+            'to_charged_off_pct', 'to_fully_paid_pct',
+        ]
 
-        # Aggregate matrix as heatmap
-        agg = pool_matrix["aggregate_matrix"]
-        agg_pct = pool_matrix["aggregate_matrix_pct"]
-
-        # Build matrix data for the Current row (the meaningful one)
-        from src.portfolio_analytics import TRANSITION_STATES
-        current_flows = agg.get("Current", {})
-        current_pcts = agg_pct.get("Current", {})
-
-        # Display as metric cards
-        st.markdown("**Expected Next-Month Dollar Flows (from Current Pool)**")
-        flow_cols = st.columns(5)
-        for i, state in enumerate(TRANSITION_STATES):
-            dollar_val = current_flows.get(state, 0)
-            pct_val = current_pcts.get(state, 0)
-            flow_cols[i].metric(
-                f"→ {state}",
-                f"${dollar_val:,.0f}",
-                f"{pct_val * 100:.2f}%",
-                delta_color="off",
-            )
-
-        # Full transition matrix heatmap (all from-states)
+        # Build weighted-average heatmap across all ages
         matrix_rows = []
-        for from_state in TRANSITION_STATES:
-            if from_state in agg_pct:
-                row = [agg_pct[from_state].get(to_state, 0)
-                       for to_state in TRANSITION_STATES]
+        for from_state in state_list:
+            state_rows = age_probs[age_probs['from_status'] == from_state]
+            if len(state_rows) > 0:
+                total_obs = state_rows['observation_count'].sum()
+                row = []
+                for pct_col in pct_cols_7:
+                    if total_obs > 0:
+                        wavg = (
+                            (state_rows[pct_col] * state_rows['observation_count'])
+                            .sum() / total_obs
+                        )
+                    else:
+                        wavg = 0.0
+                    row.append(wavg)
             else:
-                row = [0.0] * len(TRANSITION_STATES)
+                row = [0.0] * len(state_list)
             matrix_rows.append(row)
 
-        # Text labels for heatmap cells
         text_matrix = [
             [f"{v * 100:.1f}%" for v in row] for row in matrix_rows
         ]
 
         fig_tm = go.Figure(go.Heatmap(
             z=matrix_rows,
-            x=[s.replace("(0-30)", "(0-30d)").replace("(31-120)", "(31-120d)")
-               for s in TRANSITION_STATES],
-            y=[s.replace("(0-30)", "(0-30d)").replace("(31-120)", "(31-120d)")
-               for s in TRANSITION_STATES],
+            x=state_list,
+            y=state_list,
             text=text_matrix,
             texttemplate="%{text}",
-            textfont=dict(size=11),
+            textfont=dict(size=10),
             colorscale=[
                 [0, "#1a1a2e"],
                 [0.5, "#e67e22"],
@@ -409,39 +415,22 @@ with tab1:
             ),
         ))
         fig_tm.update_layout(
-            title="Transition Probability Matrix (Age-Weighted Average)",
+            title="7-State Transition Probability Matrix (Observation-Weighted Average)",
             paper_bgcolor="#0f172a",
             plot_bgcolor="#0f172a",
             font=dict(color="#e2e8f0"),
             xaxis=dict(title="To Status", side="bottom"),
             yaxis=dict(title="From Status", autorange="reversed"),
-            height=400,
+            height=450,
         )
         st.plotly_chart(fig_tm, use_container_width=True, theme=None)
 
-        # Age bucket breakdown table
-        with st.expander("View age bucket breakdown"):
-            bd = pool_matrix["breakdown_by_age"].copy()
-            bd["upb"] = bd["upb"].apply(lambda x: f"${x:,.0f}")
-            for c in [col for col in bd.columns if col.endswith("_$")]:
-                bd[c] = bd[c].apply(lambda x: f"${x:,.0f}")
-            for c in [col for col in bd.columns if col.endswith("_rate")]:
-                bd[c] = bd[c].apply(lambda x: f"{x * 100:.2f}%")
-            bd = bd.rename(columns={
-                "age_bucket_label": "Age Bucket",
-                "upb": "UPB",
-                "to_current_$": "→ Current ($)",
-                "to_delinquent_$": "→ Delinquent ($)",
-                "to_late_31_120_$": "→ Late 31-120 ($)",
-                "to_charged_off_$": "→ Charged Off ($)",
-                "to_fully_paid_$": "→ Fully Paid ($)",
-                "to_current_rate": "→ Current Rate",
-                "to_delinquent_rate": "→ Delinquent Rate",
-                "to_late_31_120_rate": "→ Late 31-120 Rate",
-                "to_charged_off_rate": "→ Charged Off Rate",
-                "to_fully_paid_rate": "→ Fully Paid Rate",
-            })
-            st.dataframe(bd, use_container_width=True, hide_index=True)
+        # Show raw probabilities table
+        with st.expander("View monthly transition probabilities"):
+            ap_display = age_probs.copy()
+            for c in pct_cols_7:
+                ap_display[c] = ap_display[c].apply(lambda x: f"{x * 100:.2f}%")
+            st.dataframe(ap_display, use_container_width=True, hide_index=True)
 
     else:
         st.info("Not enough data to compute age-weighted transition matrix.")
@@ -562,53 +551,53 @@ with tab1:
     # ── Loan Age Status Distribution ──────────────────────────────────
     st.subheader("Loan Age Status Distribution")
 
-    bucket_toggle = st.toggle(
-        "Monthly granularity", value=False, key="age_status_monthly"
-    )
-    age_bucket_size = 1 if bucket_toggle else 6
-
-    age_status = compute_loan_age_status_matrix(df_enriched, bucket_size=age_bucket_size)
+    age_status = compute_loan_age_status_matrix(df_enriched, bucket_size=1)
 
     if len(age_status) > 0:
-        # Stacked bar chart
+        # Compute UPB by status for each loan age
+        age_status["upb_current"] = age_status["total_upb"] * age_status["pct_current"]
+        age_status["upb_fully_paid"] = age_status["total_upb"] * age_status["pct_fully_paid"]
+        age_status["upb_charged_off"] = age_status["total_upb"] * age_status["pct_charged_off"]
+        age_status["upb_late_grace"] = age_status["total_upb"] * age_status["pct_late_grace"]
+
         fig_as = go.Figure()
 
         status_config = [
-            ("pct_current", "Current", "#4A90D9"),
-            ("pct_fully_paid", "Fully Paid", "#2ECC71"),
-            ("pct_charged_off", "Charged Off", "#E74C3C"),
-            ("pct_late_grace", "Late / Grace", "#F39C12"),
+            ("upb_current", "Current", "#4A90D9"),
+            ("upb_fully_paid", "Fully Paid", "#2ECC71"),
+            ("upb_charged_off", "Charged Off", "#E74C3C"),
+            ("upb_late_grace", "Late / Grace", "#F39C12"),
         ]
 
         for col, label, color in status_config:
             fig_as.add_trace(go.Bar(
                 x=age_status["age_bucket"].astype(str),
-                y=age_status[col] * 100,
+                y=age_status[col],
                 name=label,
                 marker_color=color,
                 hovertemplate=(
                     f"<b>{label}</b><br>"
-                    "Age Bucket: %{x}<br>"
-                    "%{y:.1f}%"
+                    "Loan Age: %{x} months<br>"
+                    "$%{y:,.0f}"
                     "<extra></extra>"
                 ),
             ))
 
         fig_as.update_layout(
             barmode="stack",
-            title="Status Distribution by Loan Age at Snapshot",
+            title="UPB by Loan Status at Each Loan Age",
             paper_bgcolor="#0f172a",
             plot_bgcolor="#0f172a",
             font=dict(color="#e2e8f0"),
             xaxis=dict(
-                title="Loan Age (Months)" if bucket_toggle else "Loan Age Bucket",
+                title="Loan Age (Months)",
                 gridcolor="rgba(255,255,255,0.05)",
                 type="category",
             ),
             yaxis=dict(
-                title="% of Loans",
+                title="UPB ($)",
+                tickformat="$,.0s",
                 gridcolor="rgba(255,255,255,0.05)",
-                range=[0, 105],
             ),
             legend=dict(
                 orientation="h", yanchor="bottom", y=1.02,
@@ -618,20 +607,20 @@ with tab1:
         st.plotly_chart(fig_as, use_container_width=True, theme=None)
 
         with st.expander("View age status data"):
-            as_display = age_status.copy()
-            as_display["total_upb"] = as_display["total_upb"].apply(
-                lambda x: f"${x:,.0f}"
-            )
-            for c in ["pct_current", "pct_fully_paid", "pct_charged_off", "pct_late_grace"]:
-                as_display[c] = as_display[c].apply(lambda x: f"{x * 100:.2f}%")
+            as_display = age_status[["age_bucket", "total_loans", "total_upb",
+                                     "upb_current", "upb_fully_paid",
+                                     "upb_charged_off", "upb_late_grace"]].copy()
+            for c in ["total_upb", "upb_current", "upb_fully_paid",
+                       "upb_charged_off", "upb_late_grace"]:
+                as_display[c] = as_display[c].apply(lambda x: f"${x:,.0f}")
             as_display = as_display.rename(columns={
-                "age_bucket": "Age Bucket",
+                "age_bucket": "Loan Age (Months)",
                 "total_loans": "Total Loans",
                 "total_upb": "Total UPB",
-                "pct_current": "% Current",
-                "pct_fully_paid": "% Fully Paid",
-                "pct_charged_off": "% Charged Off",
-                "pct_late_grace": "% Late/Grace",
+                "upb_current": "Current",
+                "upb_fully_paid": "Fully Paid",
+                "upb_charged_off": "Charged Off",
+                "upb_late_grace": "Late/Grace",
             })
             st.dataframe(as_display, use_container_width=True, hide_index=True)
     else:
@@ -644,23 +633,28 @@ with tab1:
 with tab2:
     st.subheader("Cash Flow Projection & IRR")
 
-    if len(df_current_march) == 0:
+    if len(df_active_march) == 0:
         st.warning(
-            "No Current loans with March 2019 payment date in this selection. "
+            "No active loans with March 2019 payment date in this selection. "
             "Cash flow projections require active loans."
         )
     else:
         # Compute historical assumptions & pool characteristics
-        pool_assumptions = compute_pool_assumptions(df_filtered, df_current_march)
-        pool_chars = compute_pool_characteristics(df_current_march)
+        pool_assumptions = compute_pool_assumptions(df_enriched, df_active_march)
+        pool_chars = compute_pool_characteristics(df_active_march)
 
         # Historical base assumptions (read-only display)
         st.markdown("#### Historical Base Assumptions")
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("CDR", f"{pool_assumptions['cdr'] * 100:.2f}%")
-        a2.metric("CPR", f"{pool_assumptions['cpr'] * 100:.2f}%")
-        a3.metric("Loss Severity", f"{pool_assumptions['loss_severity'] * 100:.2f}%")
-        a4.metric("Recovery Rate", f"{pool_assumptions['recovery_rate'] * 100:.2f}%")
+        a1, a2, a3 = st.columns(3)
+        a1.metric("CDR (Conditional)", f"{pool_assumptions['cdr'] * 100:.2f}%")
+        a2.metric("Avg MDR", f"{pool_assumptions['avg_mdr'] * 100:.4f}%")
+        a3.metric("CPR", f"{pool_assumptions['cpr'] * 100:.2f}%")
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Loss Severity", f"{pool_assumptions['loss_severity'] * 100:.2f}%")
+        b2.metric("Recovery Rate", f"{pool_assumptions['recovery_rate'] * 100:.2f}%")
+        b3.metric("Cumulative Default Rate", f"{pool_assumptions['cumulative_default_rate'] * 100:.2f}%")
+        st.caption("Cumulative Default Rate is the raw lifetime rate (reference only). CDR above is the conditional annualized rate used in projections.")
 
         # Pool characteristics
         st.markdown("#### Pool Characteristics")
@@ -670,55 +664,58 @@ with tab2:
         p3.metric("WAM", f"{pool_chars['wam']} months")
         p4.metric("Monthly Payment", f"${pool_chars['monthly_payment']:,.0f}")
 
-        # User-adjustable projection inputs
         st.markdown("---")
-        st.markdown("#### Projection Inputs")
-        i1, i2, i3 = st.columns(3)
-        with i1:
-            t2_purchase_price_pct = st.number_input(
-                "Purchase Price (%)",
-                min_value=50.00,
-                max_value=120.00,
-                value=95.00,
-                step=0.01,
-                format="%.2f",
-                key="t2_purchase_price",
-            )
-        with i2:
-            t2_cdr_pct = st.number_input(
-                "CDR (%)",
-                min_value=0.00,
-                max_value=100.00,
-                value=round(pool_assumptions["cdr"] * 100, 2),
-                step=0.01,
-                format="%.2f",
-                key="t2_cdr",
-            )
-        with i3:
-            t2_cpr_pct = st.number_input(
-                "CPR (%)",
-                min_value=0.00,
-                max_value=100.00,
-                value=round(pool_assumptions["cpr"] * 100, 2),
-                step=0.01,
-                format="%.2f",
-                key="t2_cpr",
-            )
 
-        # Convert percentage inputs to decimals
-        t2_purchase_price = t2_purchase_price_pct / 100
-        cdr = t2_cdr_pct / 100
-        cpr = t2_cpr_pct / 100
-        loss_severity = pool_assumptions["loss_severity"]
-
-        # Project cash flows
-        cf_df = project_cashflows(
-            pool_chars, cdr, cpr, loss_severity, t2_purchase_price
+        # ── State-Transition Projection ──
+        st.markdown("#### State-Transition Cash Flow Projection")
+        st.caption(
+            "Defaults flow through a 5-month delinquency pipeline "
+            "(Current → Delinquent → Late_1 → Late_2 → Late_3 → Default). "
+            "Transition probabilities are age-specific and empirically derived."
         )
+
+        # Purchase price input
+        t2_purchase_price_pct = st.number_input(
+            "Purchase Price (%)",
+            min_value=50.00,
+            max_value=120.00,
+            value=95.00,
+            step=0.01,
+            format="%.2f",
+            key="t2_purchase_price",
+        )
+        t2_purchase_price = t2_purchase_price_pct / 100
+        loss_severity = pool_assumptions["loss_severity"]
+        recovery_rate = pool_assumptions["recovery_rate"]
+
+        # Build pool state and age probs
+        with st.spinner("Computing transition probabilities..."):
+            age_probs_raw = cached_age_transition_probs(
+                df_enriched, bucket_size=1, states='7state',
+                cache_key=_filter_key)
+            # Replace empirical Current→Fully Paid with CPR-derived SMM
+            age_probs_7 = adjust_prepayment_rates(
+                age_probs_raw, pool_assumptions['cpr'])
+
+        # Enrich active loans for pool state (needs timeline columns)
+        df_active_march_enriched_t2 = df_enriched[
+            ((df_enriched["loan_status"] == "Current") & (df_enriched["last_pymnt_d"] == "2019-03-01"))
+            | (df_enriched["loan_status"].isin(non_current_active))
+        ]
+
+        pool_st = build_pool_state(df_active_march_enriched_t2)
+
+        num_months = pool_chars['wam']
+
+        with st.spinner("Projecting cash flows (state-transition)..."):
+            cf_df = project_cashflows_transition(
+                pool_st, age_probs_7, loss_severity, recovery_rate,
+                pool_chars, num_months,
+            )
+
         irr = calculate_irr(cf_df, pool_chars, t2_purchase_price)
 
         # IRR display and price solver
-        st.markdown("---")
         irr_col, price_col = st.columns(2)
 
         if np.isnan(irr) or np.isinf(irr):
@@ -726,7 +723,6 @@ with tab2:
         else:
             irr_col.metric("Projected IRR", f"{irr * 100:.2f}%")
 
-        # Price solver
         with price_col:
             target_irr_pct = st.number_input(
                 "Target IRR (%) for price solver",
@@ -738,8 +734,9 @@ with tab2:
                 key="t2_target_irr",
             )
             target_irr = target_irr_pct / 100
-            solved = solve_price(
-                pool_chars, target_irr, cdr, cpr, loss_severity
+            solved = solve_price_transition(
+                pool_st, age_probs_7, loss_severity, recovery_rate,
+                pool_chars, num_months, target_irr,
             )
             if solved is not None:
                 st.metric(
@@ -748,6 +745,56 @@ with tab2:
                 )
             else:
                 st.metric(f"Price for {target_irr_pct:.2f}% IRR", "No solution")
+
+        # UPB by state stacked area chart
+        if len(cf_df) > 0:
+            st.markdown("---")
+            st.markdown("#### Pool Balance by State")
+
+            state_cols_chart = [
+                ("current_upb", "Current", "#4A90D9"),
+                ("delinquent_upb", "Delinquent (0-30)", "#F39C12"),
+                ("late_1_upb", "Late_1", "#E67E22"),
+                ("late_2_upb", "Late_2", "#E74C3C"),
+                ("late_3_upb", "Late_3", "#9B59B6"),
+            ]
+
+            fig_state = go.Figure()
+            for col, label, color in state_cols_chart:
+                fig_state.add_trace(go.Scatter(
+                    x=cf_df["date"],
+                    y=cf_df[col],
+                    name=label,
+                    mode="lines",
+                    stackgroup="one",
+                    line=dict(width=0.5, color=color),
+                    hovertemplate=(
+                        f"<b>{label}</b><br>"
+                        "%{x|%b %Y}<br>"
+                        "$%{y:,.0f}"
+                        "<extra></extra>"
+                    ),
+                ))
+            fig_state.update_layout(
+                title="Pool Balance by State Over Time",
+                paper_bgcolor="#0f172a",
+                plot_bgcolor="#0f172a",
+                font=dict(color="#e2e8f0"),
+                xaxis=dict(
+                    title="Date",
+                    gridcolor="rgba(255,255,255,0.05)",
+                ),
+                yaxis=dict(
+                    title="UPB ($)",
+                    tickformat="$,.0s",
+                    gridcolor="rgba(255,255,255,0.05)",
+                ),
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="center", x=0.5,
+                ),
+            )
+            st.plotly_chart(fig_state, use_container_width=True, theme=None)
 
         # Monthly Cash Flows & Pool Balance (dual-axis chart)
         st.markdown("---")
@@ -882,21 +929,15 @@ with tab2:
 with tab3:
     st.subheader("Scenario Analysis")
 
-    if len(df_current_march) == 0:
+    if len(df_active_march) == 0:
         st.warning(
-            "No Current loans with March 2019 payment date in this selection. "
+            "No active loans with March 2019 payment date in this selection. "
             "Scenario analysis requires active loans."
         )
     else:
         # Reuse assumptions from Tab 2 computations
-        pool_assumptions_t3 = compute_pool_assumptions(df_filtered, df_current_march)
-        pool_chars_t3 = compute_pool_characteristics(df_current_march)
-
-        base_assumptions = {
-            "cdr": pool_assumptions_t3["cdr"],
-            "cpr": pool_assumptions_t3["cpr"],
-            "loss_severity": pool_assumptions_t3["loss_severity"],
-        }
+        pool_assumptions_t3 = compute_pool_assumptions(df_enriched, df_active_march)
+        pool_chars_t3 = compute_pool_characteristics(df_active_march)
 
         # Tab 3 controls: purchase price and stress/upside %
         s1, s2 = st.columns(2)
@@ -923,156 +964,74 @@ with tab3:
         t3_purchase_price = t3_purchase_price_pct / 100
         stress_upside_pct = stress_upside_pct_int / 100
 
-        # Build scenarios
-        scenarios = build_scenarios(
-            base_assumptions,
+        # ── State-Transition Scenarios ──
+        st.markdown("#### State-Transition Scenarios")
+        st.caption(
+            "Stress/upside shifts are applied to transition probabilities: "
+            "stress increases delinquency rates and decreases cure rates; "
+            "upside does the opposite. Loss severity is FIXED."
+        )
+
+        with st.spinner("Computing transition probabilities..."):
+            age_probs_t3_raw = cached_age_transition_probs(
+                df_enriched, bucket_size=1, states='7state',
+                cache_key=_filter_key)
+            # Replace empirical Current→Fully Paid with CPR-derived SMM
+            age_probs_t3 = adjust_prepayment_rates(
+                age_probs_t3_raw, pool_assumptions_t3['cpr'])
+
+        scenario_probs = build_scenarios_transition(
+            age_probs_t3,
             stress_pct=stress_upside_pct,
             upside_pct=stress_upside_pct,
         )
 
-        # Show scenario assumption table
-        st.markdown("#### Scenario Assumptions")
-        assumption_rows = []
-        for name, a in scenarios.items():
-            assumption_rows.append({
-                "Scenario": name,
-                "CDR": f"{a['cdr'] * 100:.2f}%",
-                "CPR": f"{a['cpr'] * 100:.2f}%",
-                "Loss Severity": f"{a['loss_severity'] * 100:.2f}%",
-            })
-        st.dataframe(
-            pd.DataFrame(assumption_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+        # Build pool state
+        df_active_march_enriched_t3 = df_enriched[
+            ((df_enriched["loan_status"] == "Current") & (df_enriched["last_pymnt_d"] == "2019-03-01"))
+            | (df_enriched["loan_status"].isin(non_current_active))
+        ]
+        pool_st_t3 = build_pool_state(df_active_march_enriched_t3)
+        num_months_t3 = pool_chars_t3['wam']
+        loss_sev_t3 = pool_assumptions_t3["loss_severity"]
+        rec_rate_t3 = pool_assumptions_t3["recovery_rate"]
 
-        # Run comparison
-        comparison = compare_scenarios(pool_chars_t3, scenarios, t3_purchase_price)
+        with st.spinner("Running scenario projections..."):
+            comparison = compare_scenarios_transition(
+                pool_st_t3, scenario_probs,
+                loss_sev_t3, rec_rate_t3,
+                pool_chars_t3, num_months_t3, t3_purchase_price,
+            )
 
-        # Format comparison table
         st.markdown("#### Scenario Comparison")
         comp_display = comparison.copy()
-        comp_display["cdr"] = comp_display["cdr"].apply(lambda x: f"{x * 100:.2f}%")
-        comp_display["cpr"] = comp_display["cpr"].apply(lambda x: f"{x * 100:.2f}%")
         comp_display["loss_severity"] = comp_display["loss_severity"].apply(
             lambda x: f"{x * 100:.2f}%"
         )
         comp_display["irr"] = comp_display["irr"].apply(
             lambda x: f"{x * 100:.2f}%" if not np.isnan(x) else "N/A"
         )
-        for c in ["total_interest", "total_principal", "total_losses", "total_recoveries"]:
-            comp_display[c] = comp_display[c].apply(lambda x: f"${x:,.0f}")
+        for c in ["total_interest", "total_principal", "total_losses",
+                   "total_recoveries", "total_defaults"]:
+            if c in comp_display.columns:
+                comp_display[c] = comp_display[c].apply(lambda x: f"${x:,.0f}")
         comp_display["weighted_avg_life"] = comp_display["weighted_avg_life"].apply(
             lambda x: f"{x:.1f} yrs"
         )
         comp_display = comp_display.rename(columns={
             "scenario": "Scenario",
-            "cdr": "CDR",
-            "cpr": "CPR",
             "loss_severity": "Loss Severity",
             "irr": "IRR",
             "total_interest": "Total Interest",
             "total_principal": "Total Principal",
             "total_losses": "Total Losses",
             "total_recoveries": "Total Recoveries",
+            "total_defaults": "Total Defaults",
             "weighted_avg_life": "WAL",
         })
         st.dataframe(comp_display, use_container_width=True, hide_index=True)
 
-        # IRR Sensitivity Heatmap: CDR vs CPR
-        st.markdown("#### IRR Sensitivity: CDR vs CPR")
-
-        base_cdr = base_assumptions["cdr"]
-        base_cpr = base_assumptions["cpr"]
-
-        # Build grid: 0% to ~2× base, 7 values each
-        cdr_grid = tuple(sorted(set([
-            0.0,
-            round(base_cdr * 0.5, 4),
-            round(base_cdr, 4),
-            round(base_cdr * 1.5, 4),
-            round(base_cdr * 2.0, 4),
-            round(base_cdr * 2.5, 4),
-            round(base_cdr * 3.0, 4),
-        ])))
-        cpr_grid = tuple(sorted(set([
-            0.0,
-            round(base_cpr * 0.5, 4),
-            round(base_cpr, 4),
-            round(base_cpr * 1.5, 4),
-            round(base_cpr * 2.0, 4),
-            round(base_cpr * 3.0, 4),
-            round(base_cpr * 4.0, 4),
-        ])))
-
-        with st.spinner("Computing IRR sensitivity grid..."):
-            irr_matrix = compute_irr_grid(
-                pool_chars_t3, cdr_grid, cpr_grid,
-                base_assumptions["loss_severity"], t3_purchase_price,
-            )
-
-        # Format labels and cell text
-        cdr_labels = [f"{v * 100:.2f}%" for v in cdr_grid]
-        cpr_labels = [f"{v * 100:.2f}%" for v in cpr_grid]
-        text_matrix = [
-            [f"{v * 100:.1f}%" if v is not None else "N/A" for v in row]
-            for row in irr_matrix
-        ]
-
-        fig_hm = go.Figure()
-
-        fig_hm.add_trace(go.Heatmap(
-            z=irr_matrix,
-            x=cpr_labels,
-            y=cdr_labels,
-            text=text_matrix,
-            texttemplate="%{text}",
-            textfont=dict(size=12),
-            colorscale=[
-                [0, "#C0392B"],
-                [0.5, "#F39C12"],
-                [1, "#2ECC71"],
-            ],
-            colorbar=dict(
-                title=dict(text="IRR", font=dict(color="#e2e8f0")),
-                tickformat=".1%",
-                tickfont=dict(color="#e2e8f0"),
-            ),
-            hovertemplate=(
-                "CDR: %{y}<br>"
-                "CPR: %{x}<br>"
-                "IRR: %{z:.2%}"
-                "<extra></extra>"
-            ),
-        ))
-
-        # Highlight base case cell
-        base_cdr_label = f"{base_cdr * 100:.2f}%"
-        base_cpr_label = f"{base_cpr * 100:.2f}%"
-        fig_hm.add_trace(go.Scatter(
-            x=[base_cpr_label],
-            y=[base_cdr_label],
-            mode="markers",
-            name="Base Case",
-            marker=dict(
-                symbol="square",
-                size=14,
-                color="rgba(0,0,0,0)",
-                line=dict(color="white", width=2),
-            ),
-        ))
-
-        fig_hm.update_layout(
-            title="IRR Sensitivity: CDR vs CPR",
-            paper_bgcolor="#0f172a",
-            plot_bgcolor="#0f172a",
-            font=dict(color="#e2e8f0"),
-            xaxis=dict(title="CPR Assumption", type="category"),
-            yaxis=dict(title="CDR Assumption", type="category"),
-        )
-        st.plotly_chart(fig_hm, use_container_width=True, theme=None)
-
-        # Balance over time — grouped bar chart by scenario
+        # Balance by scenario chart
         st.markdown("#### Projected Balance by Scenario")
         scenario_colors = {
             "Base": "#4A90D9",
@@ -1080,32 +1039,27 @@ with tab3:
             "Upside": "#2ECC71",
         }
         fig_bal = go.Figure()
-        for name, assumptions in scenarios.items():
-            cf = project_cashflows(
-                pool_chars_t3,
-                assumptions["cdr"],
-                assumptions["cpr"],
-                assumptions["loss_severity"],
-                t3_purchase_price,
+        for name, probs_df in scenario_probs.items():
+            cf = project_cashflows_transition(
+                pool_st_t3, probs_df,
+                loss_sev_t3, rec_rate_t3,
+                pool_chars_t3, num_months_t3,
             )
-            fig_bal.add_trace(go.Bar(
+            fig_bal.add_trace(go.Scatter(
                 x=cf["date"],
                 y=cf["ending_balance"],
                 name=name,
-                marker_color=scenario_colors[name],
+                mode="lines",
+                line=dict(color=scenario_colors.get(name, "#95a5a6"), width=2),
                 hovertemplate=(
                     f"<b>{name}</b><br>"
                     "%{x|%b %Y}<br>"
-                    "$%{y:,.2s}"
+                    "$%{y:,.0f}"
                     "<extra></extra>"
                 ),
             ))
-
         fig_bal.update_layout(
-            barmode="group",
-            bargap=0.15,
-            bargroupgap=0.05,
-            title="Pool Balance Over Time by Scenario",
+            title="Pool Balance Over Time by Scenario (State-Transition)",
             paper_bgcolor="#0f172a",
             plot_bgcolor="#0f172a",
             font=dict(color="#e2e8f0"),

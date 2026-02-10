@@ -83,7 +83,7 @@ def calculate_credit_metrics(df: pd.DataFrame,
     # 2. Calculate metrics for each strata value
     strata_values = df[strata_col].dropna().unique()
     for strata_value in sorted(strata_values):
-        strata_df = df[df[strata_col] == strata_value].copy()
+        strata_df = df[df[strata_col] == strata_value]
 
         strata_metrics = _calculate_metrics_for_group(
             strata_df,
@@ -186,7 +186,7 @@ def _calculate_metrics_for_group(df: pd.DataFrame,
 
     # Define active statuses
     active_statuses = ['Current', 'In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)']
-    active_loans = df[df['loan_status'].isin(active_statuses)].copy()
+    active_loans = df[df['loan_status'].isin(active_statuses)]
 
     # Total active UPB
     active_total_upb = active_loans['out_prncp'].sum()
@@ -293,9 +293,8 @@ def calculate_performance_metrics(df: pd.DataFrame,
     - pct_defaulted_upb: % of original UPB defaulted
 
     PREPAYMENT METRICS:
-    - pool_cpr_active: CPR for all active loans (Current + Late)
-    - pool_cpr_current: CPR for Current loans only
-    - pct_prepaid_current: Total prepaid principal / expected principal (Current loans only)
+    - pool_cpr: CPR for all active loans (Current + Late)
+    - pct_prepaid: Total prepaid principal / expected principal (active loans)
 
     LOSS METRICS:
     - loss_severity: lgd / (funded_amnt - total_rec_prncp) for charged off loans
@@ -320,7 +319,7 @@ def calculate_performance_metrics(df: pd.DataFrame,
     vintages = df[vintage_col].dropna().unique()
 
     for vintage in sorted(vintages):
-        vintage_df = df[df[vintage_col] == vintage].copy()
+        vintage_df = df[df[vintage_col] == vintage]
 
         metrics = {
             'vintage': vintage
@@ -370,8 +369,8 @@ def calculate_performance_metrics(df: pd.DataFrame,
         # CPR - ACTIVE LOANS (Current + Late)
         # =====================================================================
 
-        active_loans = vintage_df[vintage_df['loan_status'].isin(active_statuses)].copy()
-        paid_active = active_loans[active_loans['last_pmt_beginning_balance'] > 0].copy()
+        active_loans = vintage_df[vintage_df['loan_status'].isin(active_statuses)]
+        paid_active = active_loans[active_loans['last_pmt_beginning_balance'] > 0]
 
         if len(paid_active) > 0:
             total_beginning_balance = paid_active['last_pmt_beginning_balance'].sum()
@@ -387,49 +386,27 @@ def calculate_performance_metrics(df: pd.DataFrame,
         else:
             cpr_active = 0
 
-        metrics['pool_cpr_active'] = cpr_active
+        metrics['pool_cpr'] = cpr_active
 
         # =====================================================================
-        # CPR - CURRENT LOANS ONLY
+        # PREPAYMENT - ACTIVE LOANS
         # =====================================================================
 
-        current_loans = vintage_df[vintage_df['loan_status'] == 'Current'].copy()
-        paid_current = current_loans[current_loans['last_pmt_beginning_balance'] > 0].copy()
-
-        if len(paid_current) > 0:
-            total_beginning_balance = paid_current['last_pmt_beginning_balance'].sum()
-            total_scheduled_principal = paid_current['last_pmt_scheduled_principal'].sum()
-            total_unscheduled_principal = paid_current['last_pmt_unscheduled_principal'].sum()
-
-            denominator = total_beginning_balance - total_scheduled_principal
-            if denominator > 0:
-                smm_current = total_unscheduled_principal / denominator
-                cpr_current = 1 - (1 - smm_current) ** 12
-            else:
-                cpr_current = 0
-        else:
-            cpr_current = 0
-
-        metrics['pool_cpr_current'] = cpr_current
-
-        # =====================================================================
-        # PREPAYMENT - CURRENT LOANS ONLY
-        # =====================================================================
-
-        # Calculate prepayment for Current loans only
-        current_loans['prepaid_principal'] = (
-            current_loans['total_rec_prncp'] - current_loans['orig_exp_principal_paid']
+        # Calculate prepayment for all active loans
+        active_loans_copy = active_loans.copy()
+        active_loans_copy['prepaid_principal'] = (
+            active_loans_copy['total_rec_prncp'] - active_loans_copy['orig_exp_principal_paid']
         ).clip(lower=0)
 
-        total_prepaid_principal = current_loans['prepaid_principal'].sum()
-        total_expected_principal = current_loans['orig_exp_principal_paid'].sum()
+        total_prepaid_principal = active_loans_copy['prepaid_principal'].sum()
+        total_expected_principal = active_loans_copy['orig_exp_principal_paid'].sum()
 
         if total_expected_principal > 0:
-            pct_prepaid_current = total_prepaid_principal / total_expected_principal
+            pct_prepaid = total_prepaid_principal / total_expected_principal
         else:
-            pct_prepaid_current = 0
+            pct_prepaid = 0
 
-        metrics['pct_prepaid_current'] = pct_prepaid_current
+        metrics['pct_prepaid'] = pct_prepaid
 
         # =====================================================================
         # LOSS SEVERITY & RECOVERY RATE
@@ -491,7 +468,7 @@ def calculate_performance_metrics(df: pd.DataFrame,
         'vintage', 'orig_loan_count', 'orig_upb_mm',
         'pct_active', 'pct_current', 'pct_fully_paid', 'pct_charged_off',
         'pct_defaulted_count', 'pct_defaulted_upb',
-        'pool_cpr_active', 'pool_cpr_current', 'pct_prepaid_current',
+        'pool_cpr', 'pct_prepaid',
         'loss_severity', 'recovery_rate'
     ]
     results_df = results_df[col_order]
@@ -509,9 +486,8 @@ def calculate_performance_metrics(df: pd.DataFrame,
         display_df['pct_charged_off'] = display_df['pct_charged_off'].apply(lambda x: f"{x*100:.2f}%")
         display_df['pct_defaulted_count'] = display_df['pct_defaulted_count'].apply(lambda x: f"{x*100:.2f}%")
         display_df['pct_defaulted_upb'] = display_df['pct_defaulted_upb'].apply(lambda x: f"{x*100:.2f}%")
-        display_df['pool_cpr_active'] = display_df['pool_cpr_active'].apply(lambda x: f"{x*100:.2f}%")
-        display_df['pool_cpr_current'] = display_df['pool_cpr_current'].apply(lambda x: f"{x*100:.2f}%")
-        display_df['pct_prepaid_current'] = display_df['pct_prepaid_current'].apply(lambda x: f"{x*100:.2f}%")
+        display_df['pool_cpr'] = display_df['pool_cpr'].apply(lambda x: f"{x*100:.2f}%")
+        display_df['pct_prepaid'] = display_df['pct_prepaid'].apply(lambda x: f"{x*100:.2f}%")
         display_df['loss_severity'] = display_df['loss_severity'].apply(lambda x: f"{x*100:.2f}%")
         display_df['recovery_rate'] = display_df['recovery_rate'].apply(lambda x: f"{x*100:.2f}%")
 
@@ -579,7 +555,7 @@ def calculate_transition_matrix(df: pd.DataFrame,
         # Calculate for each strata value
         strata_values = df[strata_col].dropna().unique()
         for strata_value in sorted(strata_values):
-            strata_df = df[df[strata_col] == strata_value].copy()
+            strata_df = df[df[strata_col] == strata_value]
             flow = _calculate_transition_flow(strata_df, strata_value=strata_value)
             results.append(flow)
 
@@ -743,6 +719,17 @@ TRANSITION_STATES = [
     'Fully Paid',
 ]
 
+# 7-state model: splits Late (31-120) into 3 monthly sub-states
+TRANSITION_STATES_7 = [
+    'Current',
+    'Delinquent (0-30)',
+    'Late_1',
+    'Late_2',
+    'Late_3',
+    'Charged Off',
+    'Fully Paid',
+]
+
 
 def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -764,7 +751,8 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
         Input DataFrame with added columns: loan_age_months, age_bucket,
         age_bucket_label, delinquent_month, late_31_120_month, default_month,
         payoff_month, delinquent_age, late_31_120_age, default_age,
-        payoff_age, cured_from_late.
+        payoff_age, cured_from_late, late_1_month, late_2_month,
+        late_3_month, late_1_age, late_2_age, late_3_age.
     """
     df = df.copy()
 
@@ -813,6 +801,23 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
             df.loc[delinq_mask, 'delinquent_month'] + pd.DateOffset(months=1)
         )
 
+    # === Late sub-states (7-state model) ===
+    # Late_1 = late_31_120_month, Late_2 = +1mo, Late_3 = +2mo
+    for col in ['late_1_month', 'late_2_month', 'late_3_month']:
+        df[col] = pd.NaT
+    for col in ['late_1_age', 'late_2_age', 'late_3_age']:
+        df[col] = np.nan
+
+    late_mask = df['late_31_120_month'].notna()
+    if late_mask.any():
+        df.loc[late_mask, 'late_1_month'] = df.loc[late_mask, 'late_31_120_month']
+        df.loc[late_mask, 'late_2_month'] = (
+            df.loc[late_mask, 'late_31_120_month'] + pd.DateOffset(months=1)
+        )
+        df.loc[late_mask, 'late_3_month'] = (
+            df.loc[late_mask, 'late_31_120_month'] + pd.DateOffset(months=2)
+        )
+
     # Default at ~120 days (4 months after first missed) — terminal
     charged_off_mask = df['loan_status'] == 'Charged Off'
     if charged_off_mask.any():
@@ -827,7 +832,11 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
 
     # === Loan age at each transition (capped at term_months - 1) ===
     term_cap = df['term_months'].astype(int) - 1 if 'term_months' in df.columns else None
-    for col in ['delinquent_month', 'late_31_120_month', 'default_month', 'payoff_month']:
+    all_month_cols = [
+        'delinquent_month', 'late_31_120_month', 'default_month', 'payoff_month',
+        'late_1_month', 'late_2_month', 'late_3_month',
+    ]
+    for col in all_month_cols:
         age_col = col.replace('_month', '_age')
         mask = df[col].notna()
         if mask.any():
@@ -847,7 +856,8 @@ def reconstruct_loan_timeline(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_loan_status_at_age(df: pd.DataFrame, age: int) -> pd.Series:
+def get_loan_status_at_age(df: pd.DataFrame, age: int,
+                          states: str = '5state') -> pd.Series:
     """
     Return each loan's estimated status at a specific loan age.
 
@@ -860,14 +870,19 @@ def get_loan_status_at_age(df: pd.DataFrame, age: int) -> pd.Series:
     df : pd.DataFrame
         DataFrame with reconstructed timeline columns (loan_age_months,
         delinquent_age, late_31_120_age, default_age, payoff_age).
+        For states='7state', also needs late_1_age, late_2_age, late_3_age.
     age : int
         Loan age in months to evaluate.
+    states : str
+        '5state' (default): Current, Delinquent (0-30), Late (31-120),
+        Charged Off, Fully Paid.
+        '7state': Current, Delinquent (0-30), Late_1, Late_2, Late_3,
+        Charged Off, Fully Paid.
 
     Returns
     -------
     pd.Series
-        Status strings ('Current', 'Delinquent (0-30)', 'Late (31-120)',
-        'Charged Off', 'Fully Paid') or None for loans not yet at this age.
+        Status strings or None for loans not yet at this age.
     """
     # Start with all None (loans not yet originated at this age)
     result = pd.Series(None, index=df.index, dtype=object)
@@ -878,24 +893,48 @@ def get_loan_status_at_age(df: pd.DataFrame, age: int) -> pd.Series:
     # Default to Current for valid loans
     result[valid] = 'Current'
 
-    # Apply transitions in reverse priority order (last assignment wins)
-    # so higher-priority states overwrite lower-priority ones
+    if states == '7state':
+        # 7-state: Delinquent only at exactly delinquent_age (1 month)
+        delinq = (valid & df['delinquent_age'].notna()
+                  & (age == df['delinquent_age']))
+        result[delinq] = 'Delinquent (0-30)'
 
-    # Delinquent (0-30): at delinquent_age (lasts 1 month before progressing)
-    delinq = valid & df['delinquent_age'].notna() & (age >= df['delinquent_age'])
-    result[delinq] = 'Delinquent (0-30)'
+        # Late_1: at late_1_age (1 month)
+        late1 = (valid & df['late_1_age'].notna()
+                 & (age == df['late_1_age']))
+        result[late1] = 'Late_1'
 
-    # Late (31-120): from late_31_120_age onward (until default or snapshot)
-    late = valid & df['late_31_120_age'].notna() & (age >= df['late_31_120_age'])
-    result[late] = 'Late (31-120)'
+        # Late_2: at late_2_age (1 month)
+        late2 = (valid & df['late_2_age'].notna()
+                 & (age == df['late_2_age']))
+        result[late2] = 'Late_2'
 
-    # Fully Paid: from payoff_age onward (absorbing)
-    paid = valid & df['payoff_age'].notna() & (age >= df['payoff_age'])
-    result[paid] = 'Fully Paid'
+        # Late_3: at late_3_age (1 month)
+        late3 = (valid & df['late_3_age'].notna()
+                 & (age == df['late_3_age']))
+        result[late3] = 'Late_3'
 
-    # Charged Off: from default_age onward (absorbing, highest priority)
-    default = valid & df['default_age'].notna() & (age >= df['default_age'])
-    result[default] = 'Charged Off'
+        # Fully Paid: from payoff_age onward (absorbing)
+        paid = valid & df['payoff_age'].notna() & (age >= df['payoff_age'])
+        result[paid] = 'Fully Paid'
+
+        # Charged Off: from default_age onward (absorbing, highest priority)
+        default = valid & df['default_age'].notna() & (age >= df['default_age'])
+        result[default] = 'Charged Off'
+    else:
+        # 5-state (original behavior)
+        # Apply transitions in reverse priority order (last assignment wins)
+        delinq = valid & df['delinquent_age'].notna() & (age >= df['delinquent_age'])
+        result[delinq] = 'Delinquent (0-30)'
+
+        late = valid & df['late_31_120_age'].notna() & (age >= df['late_31_120_age'])
+        result[late] = 'Late (31-120)'
+
+        paid = valid & df['payoff_age'].notna() & (age >= df['payoff_age'])
+        result[paid] = 'Fully Paid'
+
+        default = valid & df['default_age'].notna() & (age >= df['default_age'])
+        result[default] = 'Charged Off'
 
     return result
 
@@ -903,6 +942,7 @@ def get_loan_status_at_age(df: pd.DataFrame, age: int) -> pd.Series:
 def compute_age_transition_probabilities(
     df: pd.DataFrame,
     bucket_size: int = 6,
+    states: str = '5state',
 ) -> pd.DataFrame:
     """
     Compute empirical transition probabilities at each loan age bucket.
@@ -917,25 +957,49 @@ def compute_age_transition_probabilities(
         DataFrame with reconstructed timelines (from reconstruct_loan_timeline).
         Should include ALL loans in the cohort (historical, not just current).
     bucket_size : int
-        Months per age bucket (default 6).
+        Months per age bucket (default 6). Use 1 for individual monthly ages.
+    states : str
+        '5state' (default): 5 states (Current, Delinquent, Late 31-120,
+        Charged Off, Fully Paid).
+        '7state': 7 states (Current, Delinquent, Late_1, Late_2, Late_3,
+        Charged Off, Fully Paid).
 
     Returns
     -------
     pd.DataFrame
-        Columns: age_bucket, from_status, to_current_pct,
-        to_delinquent_0_30_pct, to_late_31_120_pct, to_charged_off_pct,
-        to_fully_paid_pct, observation_count.
+        Columns: age_bucket, from_status, to_*_pct columns, observation_count.
     """
+    state_list = TRANSITION_STATES_7 if states == '7state' else TRANSITION_STATES
+
+    if states == '7state':
+        col_map = {
+            'Current': 'to_current_pct',
+            'Delinquent (0-30)': 'to_delinquent_0_30_pct',
+            'Late_1': 'to_late_1_pct',
+            'Late_2': 'to_late_2_pct',
+            'Late_3': 'to_late_3_pct',
+            'Charged Off': 'to_charged_off_pct',
+            'Fully Paid': 'to_fully_paid_pct',
+        }
+    else:
+        col_map = {
+            'Current': 'to_current_pct',
+            'Delinquent (0-30)': 'to_delinquent_0_30_pct',
+            'Late (31-120)': 'to_late_31_120_pct',
+            'Charged Off': 'to_charged_off_pct',
+            'Fully Paid': 'to_fully_paid_pct',
+        }
+
     max_age = int(df['loan_age_months'].max())
 
     # Collect all transition observations
     transitions = []
 
     # Cache: compute status at age 0, then iterate
-    prev_status = get_loan_status_at_age(df, 0)
+    prev_status = get_loan_status_at_age(df, 0, states=states)
 
     for age_n in range(0, max_age):
-        next_status = get_loan_status_at_age(df, age_n + 1)
+        next_status = get_loan_status_at_age(df, age_n + 1, states=states)
 
         # Only count loans that were valid (not None) at both ages
         valid = prev_status.notna() & next_status.notna()
@@ -945,7 +1009,10 @@ def compute_age_transition_probabilities(
 
         # Determine age bucket for this age N
         age_bucket = (age_n // bucket_size) * bucket_size
-        bucket_label = f"{age_bucket}-{age_bucket + bucket_size - 1}"
+        if bucket_size == 1:
+            bucket_label = str(age_n)
+        else:
+            bucket_label = f"{age_bucket}-{age_bucket + bucket_size - 1}"
 
         from_vals = prev_status[valid]
         to_vals = next_status[valid]
@@ -965,10 +1032,7 @@ def compute_age_transition_probabilities(
     if not transitions:
         return pd.DataFrame(columns=[
             'age_bucket', 'from_status',
-            'to_current_pct', 'to_delinquent_0_30_pct',
-            'to_late_31_120_pct', 'to_charged_off_pct',
-            'to_fully_paid_pct', 'observation_count',
-        ])
+        ] + list(col_map.values()) + ['observation_count'])
 
     all_trans = pd.concat(transitions, ignore_index=True)
 
@@ -992,22 +1056,15 @@ def compute_age_transition_probabilities(
     pivot.columns.name = None
 
     # Ensure all target states exist as columns
-    for state in TRANSITION_STATES:
+    for state in state_list:
         if state not in pivot.columns:
             pivot[state] = 0
 
     # Compute total observations per row
-    state_cols = [c for c in TRANSITION_STATES if c in pivot.columns]
+    state_cols = [c for c in state_list if c in pivot.columns]
     pivot['observation_count'] = pivot[state_cols].sum(axis=1)
 
     # Normalize to probabilities
-    col_map = {
-        'Current': 'to_current_pct',
-        'Delinquent (0-30)': 'to_delinquent_0_30_pct',
-        'Late (31-120)': 'to_late_31_120_pct',
-        'Charged Off': 'to_charged_off_pct',
-        'Fully Paid': 'to_fully_paid_pct',
-    }
     for state, pct_col in col_map.items():
         if state in pivot.columns:
             pivot[pct_col] = pivot[state] / pivot['observation_count']
@@ -1027,7 +1084,7 @@ def compute_age_transition_probabilities(
     result['_bucket_sort'] = result['age_bucket'].map(
         {b: i for i, b in enumerate(bucket_order)}
     )
-    status_order = {s: i for i, s in enumerate(TRANSITION_STATES)}
+    status_order = {s: i for i, s in enumerate(state_list)}
     result['_status_sort'] = result['from_status'].map(status_order)
     result = (
         result

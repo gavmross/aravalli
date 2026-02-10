@@ -293,8 +293,8 @@ def calculate_performance_metrics(df: pd.DataFrame,
     - pct_defaulted_upb: % of original UPB defaulted
 
     PREPAYMENT METRICS:
-    - pool_cpr: CPR for all active loans (Current + Late)
-    - pct_prepaid: Total prepaid principal / expected principal (active loans)
+    - pool_cpr: CPR for Current + Fully Paid (March 2019) loans (delinquent loans don't prepay)
+    - pct_prepaid: Total prepaid principal / expected principal (Current loans only)
 
     LOSS METRICS:
     - loss_severity: lgd / (funded_amnt - total_rec_prncp) for charged off loans
@@ -366,40 +366,50 @@ def calculate_performance_metrics(df: pd.DataFrame,
         metrics['pct_defaulted_upb'] = defaulted_upb / total_upb if total_upb > 0 else 0
 
         # =====================================================================
-        # CPR - ACTIVE LOANS (Current + Late)
+        # CPR - CURRENT + FULLY PAID (MARCH 2019) LOANS
+        # Delinquent loans aren't prepaying. Fully Paid March 2019 loans
+        # paid off that month — their payoff above scheduled principal
+        # is a prepayment event.
         # =====================================================================
 
         active_loans = vintage_df[vintage_df['loan_status'].isin(active_statuses)]
-        paid_active = active_loans[active_loans['last_pmt_beginning_balance'] > 0]
+        current_loans = vintage_df[vintage_df['loan_status'] == 'Current']
+        fp_march = vintage_df[
+            (vintage_df['loan_status'] == 'Fully Paid')
+            & (pd.to_datetime(vintage_df['last_pymnt_d'], errors='coerce')
+               == pd.Timestamp('2019-03-01'))
+        ]
+        cpr_loans = pd.concat([current_loans, fp_march], ignore_index=True)
+        paid_cpr = cpr_loans[cpr_loans['last_pmt_beginning_balance'] > 0]
 
-        if len(paid_active) > 0:
-            total_beginning_balance = paid_active['last_pmt_beginning_balance'].sum()
-            total_scheduled_principal = paid_active['last_pmt_scheduled_principal'].sum()
-            total_unscheduled_principal = paid_active['last_pmt_unscheduled_principal'].sum()
+        if len(paid_cpr) > 0:
+            total_beginning_balance = paid_cpr['last_pmt_beginning_balance'].sum()
+            total_scheduled_principal = paid_cpr['last_pmt_scheduled_principal'].sum()
+            total_unscheduled_principal = paid_cpr['last_pmt_unscheduled_principal'].sum()
 
             denominator = total_beginning_balance - total_scheduled_principal
             if denominator > 0:
-                smm_active = total_unscheduled_principal / denominator
-                cpr_active = 1 - (1 - smm_active) ** 12
+                smm_cpr = total_unscheduled_principal / denominator
+                cpr_val = 1 - (1 - smm_cpr) ** 12
             else:
-                cpr_active = 0
+                cpr_val = 0
         else:
-            cpr_active = 0
+            cpr_val = 0
 
-        metrics['pool_cpr'] = cpr_active
+        metrics['pool_cpr'] = cpr_val
 
         # =====================================================================
-        # PREPAYMENT - ACTIVE LOANS
+        # PREPAYMENT - CURRENT LOANS ONLY
         # =====================================================================
 
-        # Calculate prepayment for all active loans
-        active_loans_copy = active_loans.copy()
-        active_loans_copy['prepaid_principal'] = (
-            active_loans_copy['total_rec_prncp'] - active_loans_copy['orig_exp_principal_paid']
+        # Calculate prepayment for Current loans (delinquent loans aren't prepaying)
+        current_loans_copy = current_loans.copy()
+        current_loans_copy['prepaid_principal'] = (
+            current_loans_copy['total_rec_prncp'] - current_loans_copy['orig_exp_principal_paid']
         ).clip(lower=0)
 
-        total_prepaid_principal = active_loans_copy['prepaid_principal'].sum()
-        total_expected_principal = active_loans_copy['orig_exp_principal_paid'].sum()
+        total_prepaid_principal = current_loans_copy['prepaid_principal'].sum()
+        total_expected_principal = current_loans_copy['orig_exp_principal_paid'].sum()
 
         if total_expected_principal > 0:
             pct_prepaid = total_prepaid_principal / total_expected_principal

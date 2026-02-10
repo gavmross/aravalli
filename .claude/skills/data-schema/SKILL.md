@@ -94,8 +94,8 @@ This is the most important column for segmentation. All analysis branches on the
 
 | Status | Meaning | Used In |
 |--------|---------|---------|
-| `Current` | Loan is performing, payments current | Cash flow projections (if March 2019 last payment), credit metrics, CPR calculation (as part of active loans pool) |
-| `Fully Paid` | Loan paid off in full | CDR calculation (denominator), credit metrics |
+| `Current` | Loan is performing, payments current | Cash flow projections (if March 2019 last payment), credit metrics, CPR calculation |
+| `Fully Paid` | Loan paid off in full | CDR calculation (denominator), credit metrics, CPR calculation (if March 2019 last payment) |
 | `Charged Off` | Loan defaulted, written off | CDR (numerator), loss severity, recovery rate |
 | `Late (31-120 days)` | 31-120 days delinquent | Transition matrix, credit metrics |
 | `Late (16-30 days)` | 16-30 days delinquent | Transition matrix, credit metrics |
@@ -197,7 +197,7 @@ Understanding which loans go into which calculation is critical:
 ### For Cash Flow Projection (Tab 2) and Scenario Analysis (Tab 3)
 
 - **CDR**: Computed from ALL loans in the filtered strata (need Charged Off in numerator, all in denominator)
-- **CPR**: Computed from active loans — Current with `last_pymnt_d == '2019-03-01'` plus all delinquent (In Grace + Late) regardless of last payment date
+- **CPR**: Computed from Current + Fully Paid loans with `last_pymnt_d == '2019-03-01'`. Delinquent loans are excluded — they are behind on payments, not prepaying.
 - **Loss Severity**: Computed from Charged Off loans in the filtered strata
 - **Pool characteristics (UPB, WAC, WAM, monthly_payment)**: Active loans — Current with `last_pymnt_d == '2019-03-01'` plus all delinquent (In Grace + Late) regardless of last payment date
 - **Cash flow projections**: Run on the pool defined by the pool characteristics above

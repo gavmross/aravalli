@@ -581,7 +581,7 @@ with tab1:
                     "$%{y:,.0f}"
                     "<extra></extra>"
                 ),
-            ))
+            )) 
 
         fig_as.update_layout(
             barmode="stack",

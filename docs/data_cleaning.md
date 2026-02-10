@@ -140,7 +140,17 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 11 — Set negative late fees to zero
+### Step 11 — Reclassify Feb 2019 Current loans as In Grace Period
+
+**Action**: Change `loan_status` from "Current" to "In Grace Period" where `last_pymnt_d == 2019-02-01`.
+
+**Rationale**: The data snapshot is March 2019. Current loans with a February 2019 last payment date missed their March 2019 payment, meaning they are effectively 1–15 days past due. Reclassifying them as In Grace Period is more accurate than leaving them as Current, and it brings them into the active pool for cash flow projections. Without this step, these loans are excluded from Tabs 2 and 3 because Current loans require `last_pymnt_d == 2019-03-01`, while In Grace Period loans are included regardless of last payment date.
+
+**Impact**: **52,171** loans reclassified. No rows dropped.
+
+---
+
+### Step 12 — Set negative late fees to zero
 
 **Action**: Set `total_rec_late_fee` to 0 where the value is negative.
 
@@ -150,7 +160,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 12 — Set small late fees to zero (global, all statuses)
+### Step 13 — Set small late fees to zero (global, all statuses)
 
 **Action**: Round `total_rec_late_fee` to 2 decimal places, then set to 0 where the value is between $0 and $15 (exclusive).
 
@@ -160,17 +170,17 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 13 — Create current_late_fee_flag
+### Step 14 — Create current_late_fee_flag
 
 **Action**: Create `current_late_fee_flag = 1` for Current loans with `total_rec_late_fee > 0` (after cleaning).
 
 **Rationale**: Identifies Current loans that incurred late fees at some point during their life, indicating the borrower was delinquent at least once. Useful for credit quality segmentation within the performing pool.
 
-**Impact**: **18,419** Current loans flagged.
+**Impact**: **17,242** Current loans flagged.
 
 ---
 
-### Step 14 — Reclassify zero-balance delinquent loans as Fully Paid
+### Step 15 — Reclassify zero-balance delinquent loans as Fully Paid
 
 **Action**: For loans with `loan_status` in {In Grace Period, Late (16-30 days), Late (31-120 days)} and `out_prncp == 0`, reclassify as "Fully Paid". Create boolean flags to preserve the original status:
 - `grace_to_paid_flag`
@@ -189,7 +199,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 15 — Create upb_lost for Charged Off loans
+### Step 16 — Create upb_lost for Charged Off loans
 
 **Action**: Create `upb_lost = -(funded_amnt - total_rec_prncp - recoveries)` for Charged Off loans; 0 for all others.
 
@@ -203,7 +213,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 16 — Create joint application columns
+### Step 17 — Create joint application columns
 
 **Action**: Create three engineered columns:
 - `joint_app_flag`: 1 if `application_type != "Individual"`, else 0
@@ -218,7 +228,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 17 — Create FICO score columns
+### Step 18 — Create FICO score columns
 
 **Action**: Create averaged FICO columns:
 - `original_fico = (fico_range_high + fico_range_low) / 2`
@@ -234,7 +244,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 18 — Clean DTI
+### Step 19 — Clean DTI
 
 **Action**: Set negative `dti_clean` values to 0, then drop rows where `dti_clean` is null.
 
@@ -248,7 +258,7 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 19 — Create date feature columns
+### Step 20 — Create date feature columns
 
 **Action**: Create two columns from `issue_d`:
 - `issue_quarter`: vintage quarter (e.g., "2016Q3"), using `pd.to_period("Q")`
@@ -262,13 +272,13 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 
 ---
 
-### Step 20 — Create curr_paid_late1_flag
+### Step 21 — Create curr_paid_late1_flag
 
 **Action**: Create `curr_paid_late1_flag = 1` for loans where `loan_status` is "Fully Paid" or "Current" AND `total_rec_late_fee > 0` (after all late-fee cleaning).
 
 **Rationale**: This flag identifies loans that reached at least Late (16-30 days) status during their life (since that's when Lending Club charges late fees) but subsequently cured to Current or paid off. It is the key input to the delinquency transition matrix — it allows us to estimate the cure rate from the Late (16-30) bucket.
 
-**Statistics**: **42,433** loans flagged (1.88%).
+**Statistics**: **41,256** loans flagged (1.83%).
 
 **Impact**: No rows dropped.
 
@@ -281,10 +291,10 @@ This document describes every cleaning step applied by `scripts/export_to_sqlite
 | Status | Count | Percentage |
 |--------|------:|----------:|
 | Fully Paid | 1,081,453 | 47.95% |
-| Current | 873,773 | 38.74% |
+| Current | 821,602 | 36.42% |
 | Charged Off | 266,246 | 11.80% |
+| In Grace Period | 60,500 | 2.68% |
 | Late (31-120 days) | 21,339 | 0.95% |
-| In Grace Period | 8,329 | 0.37% |
 | Late (16-30 days) | 4,314 | 0.19% |
 | Default | 40 | 0.00% |
 
@@ -307,18 +317,18 @@ The cash flow projection engine (Tabs 2 and 3 of the dashboard) operates on **al
 | Metric | Value |
 |--------|------:|
 | Current (March 2019 last payment) | 821,602 |
-| In Grace Period (all) | 8,329 |
+| In Grace Period (all) | 60,500 |
 | Late (16-30 days) (all) | 4,314 |
 | Late (31-120 days) (all) | 21,339 |
-| **Total active loans** | **855,584** |
-| **Total outstanding UPB** | **$8,959,326,774** |
+| **Total active loans** | **907,755** |
+| **Total outstanding UPB** | **$9,508,492,787** |
 
 ### Engineered Columns Summary
 
 | Column | Non-zero count | Description |
 |--------|---------------:|-------------|
-| `current_late_fee_flag` | 18,419 | Current loans with historical late fees |
-| `curr_paid_late1_flag` | 42,433 | Current/Fully Paid loans that reached Late (16-30) |
+| `current_late_fee_flag` | 17,242 | Current loans with historical late fees |
+| `curr_paid_late1_flag` | 41,256 | Current/Fully Paid loans that reached Late (16-30) |
 | `grace_to_paid_flag` | 107 | In Grace Period reclassified to Fully Paid |
 | `late1_to_paid_flag` | 35 | Late (16-30) reclassified to Fully Paid |
 | `late2_to_paid_flag` | 26 | Late (31-120) reclassified to Fully Paid |
@@ -333,7 +343,7 @@ The cash flow projection engine (Tabs 2 and 3 of the dashboard) operates on **al
 | Step 7: Null last_pymnt_d | 2,427 | 2,460 | 2,258,241 |
 | Step 8: Credit policy loans | 2,737 | 5,197 | 2,255,504 |
 | Step 10: Stale Current loans | 6 | 5,203 | 2,255,498 |
-| Step 18: Null dti_clean | 4 | 5,207 | 2,255,494 |
+| Step 19: Null dti_clean | 4 | 5,207 | 2,255,494 |
 | **Total** | **5,207** | | **2,255,494** |
 
 ---

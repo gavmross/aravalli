@@ -33,15 +33,30 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
     CDR uses the dv01 conditional methodology: trailing 12-month average MDR,
     annualized via CDR = 1 - (1 - avg_MDR)^12.
 
+    The performing balance denominator is prepayment-adjusted: for loans still
+    active at the snapshot, we observe the gap between the scheduled balance
+    (from amortization) and the actual balance (out_prncp), spread the
+    cumulative prepayment evenly across the loan's age, and subtract the
+    prorated amount at each historical month. This avoids overstating the
+    denominator (and thus understating CDR) for pools with significant
+    prepayment activity. Loans that defaulted or paid off before the snapshot
+    use the unadjusted amortization schedule (no calibration endpoint available).
+
+    CPR is NOT prepayment-adjusted — it uses actual observed values from the
+    last payment. See CPR section below.
+
     Parameters
     ----------
     df_all : pd.DataFrame
         All loans in the filtered strata (all statuses). Must have
-        'default_month' and 'payoff_month' columns from reconstruct_loan_timeline().
-        Used for CDR and loss severity.
+        'default_month' and 'payoff_month' columns from reconstruct_loan_timeline(),
+        and calc_amort columns (last_pmt_*). Used for CDR, loss severity, and
+        Fully Paid March 2019 loans in the CPR calculation.
     df_active : pd.DataFrame
-        Active loans (Current + In Grace + Late) with last_pymnt_d == 2019-03-01,
-        with calc_amort columns already applied. Used for CPR.
+        Active loans (Current with last_pymnt_d == 2019-03-01, plus In Grace +
+        Late regardless of last payment date), with calc_amort columns applied.
+        CPR uses Current loans from this subset plus Fully Paid March 2019
+        loans from df_all. Delinquent loans don't prepay and are excluded.
 
     Returns
     -------
@@ -60,6 +75,44 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
     default_month = pd.to_datetime(df_all['default_month'], errors='coerce')
     payoff_month = pd.to_datetime(df_all['payoff_month'], errors='coerce')
 
+    # --- Precompute per-loan monthly prepayment rate for balance adjustment ---
+    # For active loans (still performing at snapshot), we can observe the actual
+    # balance (out_prncp) vs the scheduled balance.  Spreading the cumulative
+    # prepayment evenly across the loan's age gives a better estimate of what
+    # the balance was at each historical month.
+    #
+    # For Fully Paid / Charged Off loans we don't have a reliable calibration
+    # endpoint, so monthly_prepaid stays 0 (unadjusted schedule).
+
+    all_funded = df_all['funded_amnt'].values.astype(np.float64)
+    all_rates = df_all['int_rate'].values.astype(np.float64)
+    all_terms = df_all['term_months'].values.astype(np.float64)
+    all_out_prncp = df_all['out_prncp'].values.astype(np.float64)
+
+    # Age at snapshot for every loan
+    td_snapshot = np.datetime64(snapshot) - issue_dates.values
+    age_at_snapshot = np.round(
+        td_snapshot.astype('timedelta64[D]').astype(np.float64) / 30.44
+    ).astype(int).clip(min=0)
+
+    # Scheduled balance at snapshot (zero-prepayment assumption)
+    all_pmt = calc_monthly_payment(all_funded, all_rates, all_terms)
+    sched_balance_at_snapshot, _, _ = calc_balance(
+        all_funded, all_rates, all_pmt, age_at_snapshot.astype(np.float64)
+    )
+    sched_balance_at_snapshot = np.clip(sched_balance_at_snapshot, 0, None)
+
+    # Cumulative prepayment = scheduled balance - actual balance (for active loans)
+    active_statuses = {'Current', 'In Grace Period', 'Late (16-30 days)', 'Late (31-120 days)'}
+    is_active = df_all['loan_status'].isin(active_statuses).values
+    has_age = age_at_snapshot > 0
+
+    cumulative_prepaid = np.clip(sched_balance_at_snapshot - all_out_prncp, 0, None)
+    monthly_prepaid = np.zeros(len(df_all), dtype=np.float64)
+    adjustable = is_active & has_age
+    monthly_prepaid[adjustable] = cumulative_prepaid[adjustable] / age_at_snapshot[adjustable]
+
+    # --- Compute trailing 12-month MDRs ---
     monthly_mdrs = []
     for m in range(1, 13):  # trailing 12 months: Apr 2018 – Mar 2019
         month_start = snapshot - pd.DateOffset(months=m)
@@ -82,9 +135,9 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
         perf_idx = performing_mask.values.nonzero()[0]
 
         if len(perf_idx) > 0:
-            funded = df_all['funded_amnt'].values[perf_idx].astype(np.float64)
-            rates = df_all['int_rate'].values[perf_idx].astype(np.float64)
-            terms = df_all['term_months'].values[perf_idx].astype(np.float64)
+            funded = all_funded[perf_idx]
+            rates = all_rates[perf_idx]
+            terms = all_terms[perf_idx]
 
             perf_issue = issue_dates.values[perf_idx]
             td = np.datetime64(month_start) - perf_issue
@@ -93,9 +146,15 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
             ).astype(int).clip(min=0)
 
             pmt = calc_monthly_payment(funded, rates, terms)
-            est_balance, _, _ = calc_balance(funded, rates, pmt,
-                                             age_at_month.astype(np.float64))
-            performing_balance = np.clip(est_balance, 0, None).sum()
+            sched_balance, _, _ = calc_balance(funded, rates, pmt,
+                                               age_at_month.astype(np.float64))
+            sched_balance = np.clip(sched_balance, 0, None)
+
+            # Subtract prorated cumulative prepayment at this historical month
+            cum_prepaid_at_month = monthly_prepaid[perf_idx] * age_at_month
+            adj_balance = np.clip(sched_balance - cum_prepaid_at_month, 0, None)
+
+            performing_balance = adj_balance.sum()
         else:
             performing_balance = 0.0
 
@@ -114,12 +173,20 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
     cumulative_default_rate = defaulted_upb_cum / total_originated if total_originated > 0 else 0.0
 
     # --- CPR ---
-    # Same logic as pool_cpr in calculate_performance_metrics
-    paid_active = df_active[df_active['last_pmt_beginning_balance'] > 0]
-    if len(paid_active) > 0:
-        total_beginning_balance = paid_active['last_pmt_beginning_balance'].sum()
-        total_scheduled_principal = paid_active['last_pmt_scheduled_principal'].sum()
-        total_unscheduled_principal = paid_active['last_pmt_unscheduled_principal'].sum()
+    # CPR from Current loans + Fully Paid loans with March 2019 last payment.
+    # Delinquent loans aren't prepaying. Fully Paid March 2019 loans paid off
+    # that month — their payoff above scheduled principal is a prepayment.
+    current_loans = df_active[df_active['loan_status'] == 'Current']
+    fp_march = df_all[
+        (df_all['loan_status'] == 'Fully Paid')
+        & (pd.to_datetime(df_all['last_pymnt_d'], errors='coerce') == snapshot)
+    ]
+    cpr_loans = pd.concat([current_loans, fp_march], ignore_index=True)
+    paid_cpr = cpr_loans[cpr_loans['last_pmt_beginning_balance'] > 0]
+    if len(paid_cpr) > 0:
+        total_beginning_balance = paid_cpr['last_pmt_beginning_balance'].sum()
+        total_scheduled_principal = paid_cpr['last_pmt_scheduled_principal'].sum()
+        total_unscheduled_principal = paid_cpr['last_pmt_unscheduled_principal'].sum()
         denominator = total_beginning_balance - total_scheduled_principal
         if denominator > 0:
             smm = total_unscheduled_principal / denominator
@@ -438,9 +505,23 @@ def adjust_prepayment_rates(age_probs: pd.DataFrame,
         adjusted.loc[mask, 'to_current_pct'] += delta
 
         # Safety clamp
-        for col in adjusted.columns:
-            if col.startswith('to_') and col.endswith('_pct'):
-                adjusted.loc[mask, col] = adjusted.loc[mask, col].clip(0, 1)
+        pct_cols = [c for c in adjusted.columns
+                    if c.startswith('to_') and c.endswith('_pct')]
+        for col in pct_cols:
+            adjusted.loc[mask, col] = adjusted.loc[mask, col].clip(0, 1)
+
+        # If clamping caused row sums > 1.0 (extreme CPR where to_current
+        # was clamped to 0), scale non-FP columns to fill 1 - SMM exactly
+        row_sums = adjusted.loc[mask, pct_cols].sum(axis=1)
+        overshoot = row_sums > 1.0 + 1e-10
+        if overshoot.any():
+            ov_idx = overshoot[overshoot].index
+            non_fp_cols = [c for c in pct_cols if c != 'to_fully_paid_pct']
+            remaining = (1.0 - adjusted.loc[ov_idx, 'to_fully_paid_pct']).clip(lower=0)
+            non_fp_sum = adjusted.loc[ov_idx, non_fp_cols].sum(axis=1)
+            scale = remaining / non_fp_sum.clip(lower=1e-15)
+            for col in non_fp_cols:
+                adjusted.loc[ov_idx, col] *= scale
 
     return adjusted
 

@@ -2,10 +2,10 @@
 
 ## Project Overview
 
-Build an interactive Streamlit dashboard for analyzing a portfolio of ~2.2M Lending Club consumer loans. The tool lets an investor filter by pool strata, view credit/performance metrics, project cash flows under purchase price assumptions, and compare base/stress/upside scenarios with IRR calculations.
+Interactive Streamlit dashboard for analyzing a portfolio of ~2.2M Lending Club consumer loans. An investor can filter by pool strata, view credit/performance metrics, project cash flows under purchase price assumptions, and compare base/stress/upside scenarios with IRR calculations.
 
-This project has three functional parts:
-1. **Portfolio Analytics** — Pool stratifications, credit metrics, performance metrics, delinquency transitions (EXISTING — do not rewrite)
+Three functional parts:
+1. **Portfolio Analytics** — Pool stratifications, credit metrics, performance metrics, delinquency transitions
 2. **Cash Flow Projection & IRR** — Monthly projected cash flows at pool level, IRR at a purchase price, price solver for target IRR
 3. **Scenario Analysis** — Base/stress/upside comparison with user-adjustable multiplicative shifts
 
@@ -80,7 +80,7 @@ lending-club-tool/
 │   └── data_cleaning.md           ← cleaning decisions, row count stats
 ├── src/
 │   ├── __init__.py
-│   ├── amortization.py            ← calc_amort() and helpers (EXISTING)
+│   ├── amortization.py            ← calc_amort() and helpers
 │   ├── portfolio_analytics.py     ← credit/performance metrics, transitions, display functions
 │   ├── cashflow_engine.py         ← pool-level projections, IRR, price solver
 │   └── scenario_analysis.py       ← base/stress/upside scenario builder
@@ -146,7 +146,7 @@ Each module in `src/` must be independently importable. No global state. Functio
 Key rates: SMM, CPR, MDR, CDR (conditional, annualized), Loss Severity, Recovery Rate, WAC, WAM, WALA, IRR. All formulas with derivations are in `docs/calculations.md` and the lending-math skill.
 
 - **MDR (Monthly Default Rate, observed)**: For a given calendar month M: `MDR_M = defaults_in_month_M / performing_balance_at_start_of_month_M`. This parallels SMM for prepayments.
-- **CDR (Conditional Default Rate)**: `CDR = 1 - (1 - avg_MDR)^12` where `avg_MDR` is the average of 12 trailing monthly MDRs (Apr 2018 – Mar 2019). This is the PRIMARY rate used in cash flow projections. Uses the dv01 conditional methodology.
+- **CDR (Conditional Default Rate)**: `CDR = 1 - (1 - avg_MDR)^12` where `avg_MDR` is the average of 12 trailing monthly MDRs (Apr 2018 – Mar 2019). This is the PRIMARY rate used in cash flow projections. Uses the dv01 conditional methodology. The performing balance denominator is prepayment-adjusted for active loans at the snapshot (cumulative prepayment spread evenly across loan age). Fully Paid / Charged Off loans use unadjusted amortization.
 - **Cumulative Default Rate (reference only)**: `cumulative_default_rate = sum(defaulted_upb) / sum(funded_amnt)`. Raw lifetime default rate. Displayed for reference but NOT used in cash flow engine. Do NOT call this "CDR" — CDR refers only to the conditional (annualized) rate.
 - **MDR (Monthly Default Rate, for projections)**: `MDR = 1 - (1 - CDR)^(1/12)`. The round-trip is: observe monthly MDRs → average → annualize to CDR → cash flow engine converts back to MDR via this formula.
 
@@ -158,7 +158,7 @@ Key rates: SMM, CPR, MDR, CDR (conditional, annualized), Loss Severity, Recovery
 Lending Club: `accepted_2007_to_2018Q4.csv` (~2.2M loans, 151 columns). Snapshot as of March 2019.
 
 ### Data Cleaning
-Full cleaning pipeline with 19 steps is documented in `docs/data_cleaning.md`. Key points:
+Full cleaning pipeline with 21 steps is documented in `docs/data_cleaning.md`. Key points:
 - **Column whitelist** (29 raw columns kept): `id`, `loan_status`, `funded_amnt`, `int_rate`, `term`, `installment`, `grade`, `sub_grade`, `purpose`, `addr_state`, `home_ownership`, `issue_d`, `last_pymnt_d`, `next_pymnt_d`, `last_credit_pull_d`, `out_prncp`, `total_rec_prncp`, `total_rec_int`, `total_rec_late_fee`, `last_pymnt_amnt`, `recoveries`, `collection_recovery_fee`, `fico_range_high`, `fico_range_low`, `last_fico_range_high`, `last_fico_range_low`, `dti`, `dti_joint`, `annual_inc`, `annual_inc_joint`, `application_type`
 - **Engineered columns** (~17): `term_months`, `maturity_month`, `original_fico`, `latest_fico`, `dti_clean`, `annual_inc_clean`, `joint_app_flag`, `issue_quarter`, `issue_month_year`, `upb_lost`, various reclassification flags
 - `int_rate` stored as decimal (0.1078), not percentage
@@ -182,15 +182,13 @@ These reconstructed transitions are used in Tab 1 for display and as the basis f
 
 ## Function Reference
 
-### Existing Functions — DO NOT MODIFY
-
-Extracted from `scripts/analysis.ipynb`. Do not modify logic — only imports.
+### Amortization & Analytics Functions
 
 **`src/amortization.py`**:
 - `calc_amort(df, ...) → pd.DataFrame` — Adds ~20 columns (orig_exp_*, last_pmt_*, next_pmt_*, updated_remaining_term, updated_maturity_date)
 - Helpers: `calc_monthly_payment()`, `calc_balance()`, `calc_payment_num()`
 
-**`src/portfolio_analytics.py`** (existing):
+**`src/portfolio_analytics.py`**:
 - `calculate_credit_metrics(df, strata_col) → pd.DataFrame` — Requires calc_amort columns. Returns origination + active metrics by strata. Includes "ALL" row.
 - `calculate_performance_metrics(df, vintage_col='issue_quarter') → pd.DataFrame` — Requires calc_amort columns. Returns CPR, CDR, loss severity by vintage.
 - `calculate_transition_matrix(df, strata_col=None) → pd.DataFrame` — Flow-based transition probabilities.
@@ -254,7 +252,7 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 1. User selects strata → query SQLite
 2. Run `calc_amort()` on filtered data
 3. Tab 1 uses ALL loans; Tabs 2 & 3 use all active loans: Current with `last_pymnt_d == 2019-03-01` plus all delinquent (In Grace + Late 16-30 + Late 31-120 regardless of last payment date)
-4. CDR from ALL loans; CPR from active March 2019 loans; Loss severity from Charged Off subset
+4. CDR from ALL loans; CPR from Current + Fully Paid loans with March 2019 last payment date (delinquent loans don't prepay); Loss severity from Charged Off subset
 5. Tab 2 has purchase price input; Tab 3 has own price + stress/upside % slider
 
 ### Tab 1: Portfolio Metrics
@@ -290,7 +288,7 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 
 - `pytest tests/ -v` from project root
 - Test files mirror src modules. See `tests/test_*.py` for all test cases.
-- All 174 tests currently pass (72 portfolio_analytics, 48 cashflow_engine, 35 scenario_analysis, 19 amortization).
+- All 186 tests currently pass (72 portfolio_analytics, 60 cashflow_engine, 35 scenario_analysis, 19 amortization).
 - `compute_pool_assumptions` CDR:
   - Create synthetic cohort: 1000 loans originated Jan 2017. In each of the 12 trailing months (Apr 2018 – Mar 2019), 5 loans default each month with $10K exposure each. Performing balance ~$8M/month. Verify avg_MDR ≈ $50K/$8M ≈ 0.625%/month, CDR = 1-(1-0.00625)^12 ≈ 7.24%
   - Zero defaults in all 12 months: all MDRs = 0, CDR = 0
@@ -310,13 +308,13 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 
 ## Critical Rules
 
-- **NEVER rewrite** `calc_amort()`, `calculate_credit_metrics()`, `calculate_performance_metrics()`, or `calculate_transition_matrix()`. Extracted from notebook — do not modify logic.
 - **ALWAYS use sequential-thinking** MCP before implementing financial math.
 - **ALWAYS read the relevant skill file** before writing code in that domain.
+- **Run tests after any code change.** All 184 tests must pass before considering a change complete.
 - **Cash flows and scenarios operate on all active loans**: Current with March 2019 last payment date plus all delinquent (In Grace + Late 16-30 + Late 31-120) regardless of last payment date.
 - **CDR is computed from ALL loans in the cohort** using the dv01 conditional methodology: trailing 12-month average MDR, annualized. Cumulative default rate (NOT called CDR) retained for display only.
 - **`compute_pool_assumptions()` requires `reconstruct_loan_timeline()`** on df_all first (for `default_month` and `payoff_month` columns used in conditional CDR).
-- **CPR from active March 2019 loans (Current + In Grace + Late).**
+- **CPR from Current + Fully Paid loans with March 2019 last payment date.** Fully Paid March 2019 loans represent payoffs that month (prepayment events). Delinquent loans are not prepaying and are excluded.
 - **Loss severity is FIXED across all three scenarios** — only transition probabilities shift.
 - **All base/stress/upside defaults are cohort-specific**, not global averages.
 - Projection starts at t=0 (March 2019), first payment at t=1 (April 2019).

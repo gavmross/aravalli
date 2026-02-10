@@ -149,11 +149,15 @@ For each of 12 trailing months (Apr 2018 – Mar 2019):
 1. Identify defaults: loans whose default_month falls in [month_start, month_end)
    default_upb = sum(funded_amnt - total_rec_prncp)  [for defaults, clipped ≥ 0]
 
-2. Estimate performing balance at start of month:
+2. Estimate performing balance at start of month (prepayment-adjusted):
    - Loans originated before month_start
    - Not yet defaulted (default_month is null or > month_start)
    - Not yet paid off (payoff_month is null or > month_start)
-   - Balance estimated via amortization formula: calc_balance(funded_amnt, int_rate, pmt, age)
+   - Scheduled balance via amortization: sched_bal = calc_balance(funded_amnt, int_rate, pmt, age)
+   - For active loans at snapshot: adjust by prorated cumulative prepayment:
+     monthly_prepaid = max(sched_bal_at_snapshot − out_prncp, 0) / age_at_snapshot
+     adj_bal = max(sched_bal − monthly_prepaid × age, 0)
+   - For Fully Paid / Charged Off loans: use unadjusted sched_bal (no calibration endpoint)
 
 3. MDR_M = default_upb / performing_balance
 ```
@@ -173,7 +177,7 @@ This raw lifetime rate is displayed for reference but is NOT used in cash flow p
 
 ### CPR (Conditional Prepayment Rate)
 
-Computed from **all active loans**: Current loans with March 2019 last payment date plus all delinquent loans (In Grace + Late 16-30 + Late 31-120) regardless of last payment date:
+Computed from **Current + Fully Paid loans** with `last_pymnt_d = 2019-03-01`. Fully Paid March 2019 loans paid off during the observation month — their payoff above scheduled principal is a prepayment event. Delinquent loans (In Grace, Late 16-30, Late 31-120) are excluded because they are behind on scheduled payments — they are not prepaying:
 
 ```
 total_beginning_balance = sum(last_pmt_beginning_balance)
@@ -186,7 +190,7 @@ CPR = 1 - (1 - SMM)^12
 
 Only loans with `last_pmt_beginning_balance > 0` are included (avoids division by zero for loans with no prior balance).
 
-**Rationale**: CPR is computed from the most recent payment period of performing loans. The pool-level SMM aggregates across all Current loans rather than averaging individual SMMs, which would not properly weight by balance.
+**Rationale**: CPR is computed from the most recent payment period of performing loans — Current loans plus Fully Paid loans with a March 2019 last payment date (those that paid off during the observation month). The pool-level SMM aggregates across these loans rather than averaging individual SMMs, which would not properly weight by balance.
 
 ### Loss Severity
 

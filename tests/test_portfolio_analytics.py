@@ -72,6 +72,13 @@ def synthetic_loan_df():
 
         # Transition matrix flag
         'curr_paid_late1_flag': [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+
+        # Last payment date (Current=Mar 2019, FP/CO=earlier, IGP=Feb 2019)
+        'last_pymnt_d': [
+            '2019-03-01', '2018-12-01', '2019-03-01', '2019-03-01',
+            '2018-11-01', '2018-06-01', '2019-03-01', '2018-08-01',
+            '2019-02-01', '2018-10-01'
+        ],
     })
 
     return df

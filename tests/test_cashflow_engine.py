@@ -48,6 +48,11 @@ def synthetic_df_all():
     issue_d = ['2017-01-01'] * n_total
     recoveries = [0.0] * n_total
 
+    # out_prncp: Charged Off loans = 0, Current loans ≈ scheduled balance
+    # Setting Current loans to ~$3100 (close to amortized balance at 26 months)
+    # so prepayment adjustment is minimal and existing test bounds still hold.
+    out_prncp = [0.0] * n_defaults + [3100.0] * (n_total - n_defaults)
+
     # Statuses: first 60 are Charged Off (5 per month × 12 months), rest Current
     loan_status = ['Charged Off'] * n_defaults + ['Current'] * (n_total - n_defaults)
 
@@ -66,6 +71,9 @@ def synthetic_df_all():
     # Recoveries for charged off loans
     recoveries[:n_defaults] = [500.0] * n_defaults  # some recovery
 
+    # last_pymnt_d: Current = March 2019, Charged Off = earlier date
+    last_pymnt_d = ['2018-01-01'] * n_defaults + ['2019-03-01'] * (n_total - n_defaults)
+
     return pd.DataFrame({
         'funded_amnt': funded,
         'total_rec_prncp': rec_prncp,
@@ -74,8 +82,10 @@ def synthetic_df_all():
         'issue_d': issue_d,
         'int_rate': int_rate,
         'term_months': term_months,
+        'out_prncp': out_prncp,
         'default_month': default_months,
         'payoff_month': payoff_months,
+        'last_pymnt_d': last_pymnt_d,
     })
 
 
@@ -86,6 +96,7 @@ def synthetic_df_active():
     All have last_pymnt_d == 2019-03-01 and calc_amort columns.
     """
     return pd.DataFrame({
+        'loan_status': ['Current', 'Current', 'Current', 'Current', 'Current'],
         'out_prncp': [5000.0, 8000.0, 3000.0, 10000.0, 4000.0],
         'int_rate': [0.10, 0.12, 0.08, 0.14, 0.09],
         'installment': [300.0, 500.0, 200.0, 700.0, 250.0],
@@ -182,6 +193,93 @@ class TestComputePoolAssumptions:
         result = compute_pool_assumptions(synthetic_df_all, synthetic_df_active)
         assert result['cpr'] >= 0
 
+    def test_cpr_includes_fully_paid_march_2019(self, synthetic_df_active):
+        """Fully Paid loans with last_pymnt_d == March 2019 should contribute to CPR.
+
+        Run 1: df_all has no FP March loans → CPR from Current only.
+        Run 2: df_all has FP March loans with large unscheduled principal → higher CPR.
+        """
+        # df_all with no FP March 2019 loans
+        df_all_no_fp = pd.DataFrame({
+            'funded_amnt': [10000.0, 10000.0],
+            'total_rec_prncp': [0.0, 5000.0],
+            'loan_status': ['Charged Off', 'Current'],
+            'recoveries': [500.0, 0.0],
+            'issue_d': ['2017-01-01', '2017-01-01'],
+            'int_rate': [0.10, 0.10],
+            'term_months': [36, 36],
+            'out_prncp': [0.0, 5000.0],
+            'default_month': ['2018-10-01', None],
+            'payoff_month': [None, None],
+            'last_pymnt_d': ['2018-10-01', '2019-03-01'],
+        })
+        result_no_fp = compute_pool_assumptions(df_all_no_fp, synthetic_df_active)
+
+        # df_all with FP March 2019 loans that had big prepayments
+        df_all_with_fp = pd.DataFrame({
+            'funded_amnt': [10000.0, 10000.0, 10000.0],
+            'total_rec_prncp': [0.0, 5000.0, 10000.0],
+            'loan_status': ['Charged Off', 'Current', 'Fully Paid'],
+            'recoveries': [500.0, 0.0, 0.0],
+            'issue_d': ['2017-01-01', '2017-01-01', '2017-01-01'],
+            'int_rate': [0.10, 0.10, 0.10],
+            'term_months': [36, 36, 36],
+            'out_prncp': [0.0, 5000.0, 0.0],
+            'default_month': ['2018-10-01', None, None],
+            'payoff_month': [None, None, '2019-03-01'],
+            'last_pymnt_d': ['2018-10-01', '2019-03-01', '2019-03-01'],
+            # calc_amort columns for the FP loan (paid off entire remaining balance)
+            'last_pmt_beginning_balance': [0.0, 0.0, 3000.0],
+            'last_pmt_scheduled_principal': [0.0, 0.0, 200.0],
+            'last_pmt_unscheduled_principal': [0.0, 0.0, 2800.0],
+        })
+        result_with_fp = compute_pool_assumptions(df_all_with_fp, synthetic_df_active)
+
+        # CPR should be higher when FP March 2019 loans are included
+        assert result_with_fp['cpr'] > result_no_fp['cpr'], (
+            f"CPR with FP March ({result_with_fp['cpr']:.6f}) should exceed "
+            f"CPR without ({result_no_fp['cpr']:.6f})"
+        )
+
+    def test_cpr_excludes_fully_paid_non_march(self, synthetic_df_active):
+        """Fully Paid loans with last_pymnt_d != March 2019 should NOT affect CPR."""
+        # df_all with FP loan that paid off in December 2018
+        df_all = pd.DataFrame({
+            'funded_amnt': [10000.0, 10000.0],
+            'total_rec_prncp': [5000.0, 10000.0],
+            'loan_status': ['Current', 'Fully Paid'],
+            'recoveries': [0.0, 0.0],
+            'issue_d': ['2017-01-01', '2017-01-01'],
+            'int_rate': [0.10, 0.10],
+            'term_months': [36, 36],
+            'out_prncp': [5000.0, 0.0],
+            'default_month': [None, None],
+            'payoff_month': [None, '2018-12-01'],
+            'last_pymnt_d': ['2019-03-01', '2018-12-01'],
+            'last_pmt_beginning_balance': [0.0, 3000.0],
+            'last_pmt_scheduled_principal': [0.0, 200.0],
+            'last_pmt_unscheduled_principal': [0.0, 2800.0],
+        })
+        result = compute_pool_assumptions(df_all, synthetic_df_active)
+        # CPR should come only from synthetic_df_active (Current loans)
+        result_baseline = compute_pool_assumptions(
+            pd.DataFrame({
+                'funded_amnt': [10000.0],
+                'total_rec_prncp': [5000.0],
+                'loan_status': ['Current'],
+                'recoveries': [0.0],
+                'issue_d': ['2017-01-01'],
+                'int_rate': [0.10],
+                'term_months': [36],
+                'out_prncp': [5000.0],
+                'default_month': [None],
+                'payoff_month': [None],
+                'last_pymnt_d': ['2019-03-01'],
+            }),
+            synthetic_df_active,
+        )
+        assert abs(result['cpr'] - result_baseline['cpr']) < 1e-10
+
     def test_cdr_zero_when_no_defaults(self, synthetic_df_active):
         """Zero defaults in all 12 months → CDR = 0."""
         df_all = pd.DataFrame({
@@ -192,8 +290,10 @@ class TestComputePoolAssumptions:
             'issue_d': ['2017-01-01', '2017-01-01'],
             'int_rate': [0.10, 0.10],
             'term_months': [36, 36],
+            'out_prncp': [0.0, 5000.0],
             'default_month': [None, None],
             'payoff_month': ['2018-06-01', None],
+            'last_pymnt_d': ['2018-06-01', '2019-03-01'],
         })
         result = compute_pool_assumptions(df_all, synthetic_df_active)
         assert result['cdr'] == 0.0
@@ -205,6 +305,105 @@ class TestComputePoolAssumptions:
         result = compute_pool_assumptions(synthetic_df_all, synthetic_df_active)
         for mdr in result['monthly_mdrs']:
             assert mdr >= 0.0
+
+    def test_cdr_prepayment_adjusted_denominator(self, synthetic_df_active):
+        """CDR denominator should be lower when loans have prepaid.
+
+        Two runs with identical defaults but different out_prncp for Current loans:
+        - Run 1: out_prncp = scheduled balance → no prepayment adjustment
+        - Run 2: out_prncp < scheduled balance → adjustment reduces denominator
+        Higher CDR expected in Run 2 (same numerator, smaller denominator).
+        """
+        n_total = 100
+        n_defaults_per_month = 1
+        n_defaults = n_defaults_per_month * 12
+
+        funded = [10000.0] * n_total
+        rec_prncp = [0.0] * n_total
+        int_rate = [0.10] * n_total
+        term_months = [36] * n_total
+        issue_d = ['2017-01-01'] * n_total
+        recoveries = [0.0] * n_total
+        loan_status = ['Charged Off'] * n_defaults + ['Current'] * (n_total - n_defaults)
+
+        snapshot = pd.Timestamp('2019-03-01')
+        default_months = []
+        for m in range(12, 0, -1):
+            month_start = snapshot - pd.DateOffset(months=m)
+            default_months.extend([month_start.strftime('%Y-%m-%d')] * n_defaults_per_month)
+        default_months.extend([None] * (n_total - n_defaults))
+        payoff_months = [None] * n_total
+
+        # Compute the scheduled balance at snapshot for Current loans
+        # (26 months seasoning at 10%, 36-month term, $10K)
+        from src.amortization import calc_monthly_payment, calc_balance
+        sched_pmt = calc_monthly_payment(
+            np.array([10000.0]), np.array([0.10]), np.array([36.0])
+        )[0]
+        sched_bal, _, _ = calc_balance(
+            np.array([10000.0]), np.array([0.10]),
+            np.array([sched_pmt]), np.array([26.0])
+        )
+        sched_bal_at_snapshot = max(sched_bal[0], 0.0)
+
+        # Run 1: no prepayment (out_prncp = scheduled balance)
+        out_prncp_no_prepay = [0.0] * n_defaults + [sched_bal_at_snapshot] * (n_total - n_defaults)
+        last_pymnt_d = ['2018-01-01'] * n_defaults + ['2019-03-01'] * (n_total - n_defaults)
+        df_all_1 = pd.DataFrame({
+            'funded_amnt': funded, 'total_rec_prncp': rec_prncp,
+            'loan_status': loan_status, 'recoveries': recoveries,
+            'issue_d': issue_d, 'int_rate': int_rate,
+            'term_months': term_months, 'out_prncp': out_prncp_no_prepay,
+            'default_month': default_months, 'payoff_month': payoff_months,
+            'last_pymnt_d': last_pymnt_d,
+        })
+        result_1 = compute_pool_assumptions(df_all_1, synthetic_df_active)
+
+        # Run 2: significant prepayment (out_prncp = 50% of scheduled balance)
+        out_prncp_prepaid = [0.0] * n_defaults + [sched_bal_at_snapshot * 0.5] * (n_total - n_defaults)
+        df_all_2 = pd.DataFrame({
+            'funded_amnt': funded, 'total_rec_prncp': rec_prncp,
+            'loan_status': loan_status, 'recoveries': recoveries,
+            'issue_d': issue_d, 'int_rate': int_rate,
+            'term_months': term_months, 'out_prncp': out_prncp_prepaid,
+            'default_month': default_months, 'payoff_month': payoff_months,
+            'last_pymnt_d': last_pymnt_d,
+        })
+        result_2 = compute_pool_assumptions(df_all_2, synthetic_df_active)
+
+        # Same numerator, smaller denominator → higher CDR
+        assert result_2['cdr'] > result_1['cdr'], (
+            f"Prepayment-adjusted CDR ({result_2['cdr']:.6f}) should be > "
+            f"unadjusted ({result_1['cdr']:.6f})"
+        )
+        assert result_2['avg_mdr'] > result_1['avg_mdr']
+
+        # Both should still be valid CDRs
+        assert 0 < result_1['cdr'] < 1.0
+        assert 0 < result_2['cdr'] < 1.0
+
+    def test_cdr_no_adjustment_for_charged_off(self, synthetic_df_active):
+        """Charged Off / Fully Paid loans should use unadjusted schedule.
+        Setting out_prncp to 0 for Charged Off loans should NOT affect CDR
+        (they are not active, so monthly_prepaid stays 0)."""
+        df_all = pd.DataFrame({
+            'funded_amnt': [10000.0, 10000.0],
+            'total_rec_prncp': [0.0, 5000.0],
+            'loan_status': ['Charged Off', 'Fully Paid'],
+            'recoveries': [500.0, 0.0],
+            'issue_d': ['2017-01-01', '2017-01-01'],
+            'int_rate': [0.10, 0.10],
+            'term_months': [36, 36],
+            'out_prncp': [0.0, 0.0],
+            'default_month': ['2018-10-01', None],
+            'payoff_month': [None, '2018-12-01'],
+            'last_pymnt_d': ['2018-10-01', '2018-12-01'],
+        })
+        result = compute_pool_assumptions(df_all, synthetic_df_active)
+        # CDR should be non-zero (there's a default)
+        assert result['cdr'] > 0
+        # The adjustment should not have kicked in (no active loans in df_all)
+        assert len(result['monthly_mdrs']) == 12
 
 
 # ---------------------------------------------------------------------------
@@ -886,3 +1085,23 @@ class TestAdjustPrepaymentRates:
             current_orig['to_delinquent_0_30_pct'].values,
             current_adj['to_delinquent_0_30_pct'].values,
         )
+
+    def test_extreme_cpr_row_sums_to_one(self, simple_7state_probs):
+        """At CPR=1.0 (100% prepayment), rows should still sum to 1.0."""
+        adjusted = adjust_prepayment_rates(simple_7state_probs, 1.0)
+        current_rows = adjusted[adjusted['from_status'] == 'Current']
+        pct_cols = [c for c in adjusted.columns
+                    if c.startswith('to_') and c.endswith('_pct')]
+        row_sums = current_rows[pct_cols].sum(axis=1)
+        for s in row_sums:
+            assert abs(s - 1.0) < 1e-6, f"Row sum {s} != 1.0 at CPR=1.0"
+
+    def test_high_cpr_row_sums_to_one(self, simple_7state_probs):
+        """At CPR=0.9999 (near-100%), rows should still sum to 1.0."""
+        adjusted = adjust_prepayment_rates(simple_7state_probs, 0.9999)
+        current_rows = adjusted[adjusted['from_status'] == 'Current']
+        pct_cols = [c for c in adjusted.columns
+                    if c.startswith('to_') and c.endswith('_pct')]
+        row_sums = current_rows[pct_cols].sum(axis=1)
+        for s in row_sums:
+            assert abs(s - 1.0) < 1e-6, f"Row sum {s} != 1.0 at CPR=0.9999"

@@ -193,7 +193,7 @@ doc.add_heading("Portfolio Composition", level=3)
 
 doc.add_paragraph(
     "The 2.26 million-loan portfolio has $33.9 billion in total originated UPB, of which "
-    "$9.1 billion remains outstanding across 873,773 Current loans. The portfolio is heavily "
+    "$9.5 billion remains outstanding across 907,755 active loans (821,602 Current plus ~86,000 in delinquency stages). The portfolio is heavily "
     "concentrated in investment-grade credits: Grades A through C account for 77% of loans "
     "and 74% of originated volume. The weighted average coupon is 13.12%, with a weighted "
     "average remaining maturity of 34 months."

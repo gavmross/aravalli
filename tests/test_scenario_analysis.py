@@ -67,6 +67,8 @@ def synthetic_df_all():
         'issue_d': ['2017-01-01'] * 10,
         'int_rate': [0.10] * 10,
         'term_months': [36] * 10,
+        'out_prncp': [0.0, 0.0, 0.0, 0.0, 0.0,
+                      3100.0, 3100.0, 0.0, 3100.0, 0.0],
         'default_month': [
             '2018-06-01', None, None, '2018-09-01', None,
             None, None, None, None, '2019-01-01'
@@ -75,6 +77,10 @@ def synthetic_df_all():
             None, '2018-12-01', '2019-02-01', None, '2018-10-01',
             None, None, '2019-01-01', None, None
         ],
+        'last_pymnt_d': [
+            '2018-06-01', '2018-12-01', '2019-02-01', '2018-09-01', '2018-10-01',
+            '2019-03-01', '2019-03-01', '2019-01-01', '2019-03-01', '2019-01-01'
+        ],
     })
 
 
@@ -82,6 +88,7 @@ def synthetic_df_all():
 def synthetic_df_active():
     """Synthetic active loans for compute_base_assumptions."""
     return pd.DataFrame({
+        'loan_status': ['Current', 'Current', 'Current'],
         'out_prncp': [5000.0, 8000.0, 3000.0],
         'int_rate': [0.10, 0.12, 0.08],
         'installment': [300.0, 500.0, 200.0],

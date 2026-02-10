@@ -110,7 +110,7 @@ Some values appear in multiple places. Verify consistency:
 
 - The list of `calc_amort()` output columns appears in CLAUDE.md, `user_guide.md`, and potentially `calculations.md`. All must match.
 - The list of strata columns appears in CLAUDE.md and `user_guide.md`. Both must match what the code accepts.
-- The data flow description (CDR from all loans, CPR from Current March 2019 only) appears in CLAUDE.md and `calculations.md`. Both must match `cashflow_engine.py`.
+- The data flow description (CDR from all loans, CPR from Current + Fully Paid March 2019) appears in CLAUDE.md and `calculations.md`. Both must match `cashflow_engine.py`.
 
 ## Output Format
 

@@ -65,7 +65,7 @@ python scripts/export_to_sqlite.py
 
 **What this does**:
 - Reads `data/accepted_2007_to_2018Q4.csv` (~2.2M loans)
-- Applies 20 cleaning steps (documented in [data_cleaning.md](data_cleaning.md))
+- Applies 21 cleaning steps (documented in [data_cleaning.md](data_cleaning.md))
 - Writes cleaned data to `data/loans.db` (SQLite)
 - Final count: 2,255,494 loans
 
@@ -218,7 +218,7 @@ A table with one row per vintage quarter, showing historical performance:
 | `pct_charged_off` | % of loans charged off |
 | `pct_defaulted_count` | Default rate by count |
 | `pct_defaulted_upb` | Default rate by UPB |
-| `pool_cpr` | CPR for active loans (Current + In Grace + Late) |
+| `pool_cpr` | CPR for Current + Fully Paid (March 2019) loans (delinquent loans excluded) |
 | `loss_severity` | Loss severity for charged-off loans |
 | `recovery_rate` | Recovery rate (= 1 - loss severity) |
 
@@ -266,7 +266,7 @@ Six cards showing the computed base-case assumptions:
 |--------|--------|
 | CDR (Conditional) | Annualized from trailing 12-month average MDR (all loans in filter) |
 | Avg MDR | Un-annualized monthly default rate |
-| CPR | From active March 2019 loans (pool-level SMM annualized) |
+| CPR | From Current + Fully Paid loans with March 2019 last payment (pool-level SMM annualized). Delinquent loans excluded — they are behind on payments, not prepaying. |
 | Loss Severity | From Charged Off loans with capped recoveries |
 | Recovery Rate | 1 - Loss Severity |
 | Cumulative Default Rate | Raw lifetime rate (reference only, NOT used in projections) |
@@ -404,7 +404,8 @@ Understanding which loans feed into which calculations is critical:
 - **Tab 1** uses ALL loans matching the sidebar filter
 - **Tabs 2 & 3** use two populations:
   - **CDR and Loss Severity**: ALL loans in the filter (need Charged Off loans)
-  - **CPR, Pool Characteristics, Cash Flows**: Active loans — Current with `last_pymnt_d = 2019-03-01` plus all delinquent (In Grace + Late) regardless of last payment date
+  - **Pool Characteristics, Cash Flows**: Active loans — Current with `last_pymnt_d = 2019-03-01` plus all delinquent (In Grace + Late) regardless of last payment date
+  - **CPR**: Current + Fully Paid loans with `last_pymnt_d = 2019-03-01`. Fully Paid March 2019 loans represent payoffs that month. Delinquent loans are excluded — they are behind on payments, not prepaying.
 
 ---
 

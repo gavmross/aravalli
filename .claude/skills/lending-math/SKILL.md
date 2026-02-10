@@ -316,7 +316,7 @@ Scenarios are built by applying multipliers to the **base case CDR and CPR**. Lo
 Base case CDR and CPR come from `compute_pool_assumptions()`, which uses **historical data for the filtered cohort**:
 
 - **CDR**: From ALL loans in the strata (need Charged Off loans to calculate default rate)
-- **CPR**: From active loans — Current with March 2019 last payment date plus all delinquent (In Grace + Late) regardless of last payment date
+- **CPR**: From Current + Fully Paid loans with March 2019 last payment date. Delinquent loans are excluded — they are behind on payments, not prepaying.
 - **Loss Severity**: From Charged Off loans in the strata (with capped recoveries)
 
 These are cohort-specific, not global averages. If the user filters to "Grade B, 36-month, 2016Q4", the base case reflects that specific cohort's historical performance.
@@ -357,4 +357,4 @@ Balance_12 = 10000 × [1.008333^36 - 1.008333^12] / [1.008333^36 - 1] = **$6,915
 5. **Using funded_amnt instead of out_prncp for current pool metrics** — funded_amnt is the original amount; out_prncp is what's still outstanding.
 6. **Confusing original vs current WAC** — Original WAC weights by funded_amnt; current WAC weights by out_prncp. Cash flow projections use current WAC.
 7. **Annualizing IRR as monthly_irr × 12** — Wrong. Use (1 + monthly_irr)^12 - 1 for compounding.
-8. **Applying CPR to cohort-level SMM** — The CPR provided to `compute_pool_assumptions()` should come from active loans (Current + In Grace + Late) with March 2019 last payment only, not all loans.
+8. **Applying CPR to wrong population** — CPR is computed from Current + Fully Paid (March 2019) loans only (not all active loans). Delinquent loans are behind on payments, not prepaying. Including them dilutes the true prepayment rate.

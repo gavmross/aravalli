@@ -224,7 +224,29 @@ def drop_stale_current(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===================================================================
-# STEP 11 — Set negative total_rec_late_fee to 0
+# STEP 11 — Reclassify Feb 2019 Current loans as In Grace Period
+# ===================================================================
+def reclassify_current_feb_2019(df: pd.DataFrame) -> pd.DataFrame:
+    """Reclassify Current loans with last_pymnt_d == Feb 2019 as In Grace Period.
+
+    These loans missed their March 2019 payment (the snapshot month), which
+    means they are effectively 1-15 days past due.  Reclassifying them as
+    In Grace Period is more accurate than leaving them as Current, and it
+    brings them into the active pool for cash flow projections (In Grace
+    Period loans are included regardless of last payment date).
+    """
+    df = df.copy()
+    feb_2019 = pd.Timestamp("2019-02-01")
+    mask = (df["loan_status"] == "Current") & (df["last_pymnt_d"] == feb_2019)
+    count = mask.sum()
+    df.loc[mask, "loan_status"] = "In Grace Period"
+    log.info(f"  Reclassified {count:,} Current (Feb 2019) → In Grace Period")
+    _step(11, "Reclassify Feb 2019 Current → In Grace Period", df)
+    return df
+
+
+# ===================================================================
+# STEP 12 — Set negative total_rec_late_fee to 0
 # ===================================================================
 def clean_negative_late_fees(df: pd.DataFrame) -> pd.DataFrame:
     """Set negative total_rec_late_fee values to 0."""
@@ -233,12 +255,12 @@ def clean_negative_late_fees(df: pd.DataFrame) -> pd.DataFrame:
     count = neg_mask.sum()
     df.loc[neg_mask, "total_rec_late_fee"] = 0.0
     log.info(f"  Zeroed {count:,} negative total_rec_late_fee values")
-    _step(11, "Clean negative late fees", df)
+    _step(12, "Clean negative late fees", df)
     return df
 
 
 # ===================================================================
-# STEP 12 — Set total_rec_late_fee < $15 to 0 (globally)
+# STEP 13 — Set total_rec_late_fee < $15 to 0 (globally)
 # ===================================================================
 def clean_small_late_fees(df: pd.DataFrame) -> pd.DataFrame:
     """Set total_rec_late_fee to 0 where < $15 (LC min late fee is $15)."""
@@ -248,12 +270,12 @@ def clean_small_late_fees(df: pd.DataFrame) -> pd.DataFrame:
     count = small_mask.sum()
     df.loc[small_mask, "total_rec_late_fee"] = 0.0
     log.info(f"  Zeroed {count:,} late fees between $0–$15")
-    _step(12, "Clean small late fees (< $15 → 0)", df)
+    _step(13, "Clean small late fees (< $15 → 0)", df)
     return df
 
 
 # ===================================================================
-# STEP 13 — Create current_late_fee_flag
+# STEP 14 — Create current_late_fee_flag
 # ===================================================================
 def create_current_late_fee_flag(df: pd.DataFrame) -> pd.DataFrame:
     """Flag Current loans that have late fees > $15 (after cleaning)."""
@@ -262,12 +284,12 @@ def create_current_late_fee_flag(df: pd.DataFrame) -> pd.DataFrame:
     df["current_late_fee_flag"] = np.where(mask, 1, 0)
     count = df["current_late_fee_flag"].sum()
     log.info(f"  current_late_fee_flag = 1 for {count:,} loans")
-    _step(13, "Create current_late_fee_flag", df)
+    _step(14, "Create current_late_fee_flag", df)
     return df
 
 
 # ===================================================================
-# STEP 14 — Reclassify Grace/Late with out_prncp == 0; create flags
+# STEP 15 — Reclassify Grace/Late with out_prncp == 0; create flags
 # ===================================================================
 def reclassify_delinquent_zero_balance(df: pd.DataFrame) -> pd.DataFrame:
     """Reclassify In Grace/Late loans with $0 balance as Fully Paid; create flags."""
@@ -287,12 +309,12 @@ def reclassify_delinquent_zero_balance(df: pd.DataFrame) -> pd.DataFrame:
     # Reclassify to Fully Paid
     df.loc[mask_grace | mask_late1 | mask_late2, "loan_status"] = "Fully Paid"
     log.info(f"  Reclassified {total_reclassified:,} delinquent → Fully Paid")
-    _step(14, "Reclassify zero-balance delinquent → Fully Paid", df)
+    _step(15, "Reclassify zero-balance delinquent → Fully Paid", df)
     return df
 
 
 # ===================================================================
-# STEP 15 — Create upb_lost for Charged Off loans
+# STEP 16 — Create upb_lost for Charged Off loans
 # ===================================================================
 def create_upb_lost(df: pd.DataFrame) -> pd.DataFrame:
     """Create upb_lost = -(funded_amnt - total_rec_prncp - recoveries) for Charged Off."""
@@ -306,12 +328,12 @@ def create_upb_lost(df: pd.DataFrame) -> pd.DataFrame:
     co_count = mask.sum()
     avg_loss = df.loc[mask, "upb_lost"].mean() if co_count > 0 else 0
     log.info(f"  Charged Off loans: {co_count:,}, avg upb_lost: ${avg_loss:,.2f}")
-    _step(15, "Create upb_lost", df)
+    _step(16, "Create upb_lost", df)
     return df
 
 
 # ===================================================================
-# STEP 16 — Create joint_app_flag, dti_clean, annual_inc_clean
+# STEP 17 — Create joint_app_flag, dti_clean, annual_inc_clean
 # ===================================================================
 def create_joint_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Create joint_app_flag, dti_clean, annual_inc_clean."""
@@ -336,12 +358,12 @@ def create_joint_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["annual_inc_joint"],
     )
 
-    _step(16, "Create joint_app_flag, dti_clean, annual_inc_clean", df)
+    _step(17, "Create joint_app_flag, dti_clean, annual_inc_clean", df)
     return df
 
 
 # ===================================================================
-# STEP 17 — Create original_fico, latest_fico
+# STEP 18 — Create original_fico, latest_fico
 # ===================================================================
 def create_fico_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Create averaged FICO columns."""
@@ -350,12 +372,12 @@ def create_fico_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["latest_fico"] = (df["last_fico_range_high"] + df["last_fico_range_low"]) / 2
     log.info(f"  original_fico range: {df['original_fico'].min():.0f} – {df['original_fico'].max():.0f}")
     log.info(f"  latest_fico range:   {df['latest_fico'].min():.0f} – {df['latest_fico'].max():.0f}")
-    _step(17, "Create original_fico, latest_fico", df)
+    _step(18, "Create original_fico, latest_fico", df)
     return df
 
 
 # ===================================================================
-# STEP 18 — Clean dti_clean: set negative to 0, drop nulls
+# STEP 19 — Clean dti_clean: set negative to 0, drop nulls
 # ===================================================================
 def clean_dti(df: pd.DataFrame) -> pd.DataFrame:
     """Set negative dti_clean to 0; drop rows with null dti_clean."""
@@ -372,12 +394,12 @@ def clean_dti(df: pd.DataFrame) -> pd.DataFrame:
     df = df.loc[df["dti_clean"].notna()].copy()
     dropped = before - len(df)
     log.info(f"  Dropped {dropped:,} rows with null dti_clean")
-    _step(18, "Clean dti_clean", df)
+    _step(19, "Clean dti_clean", df)
     return df
 
 
 # ===================================================================
-# STEP 19 — Create issue_quarter, issue_month_year
+# STEP 20 — Create issue_quarter, issue_month_year
 # ===================================================================
 def create_date_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create issue_quarter and issue_month_year from issue_d."""
@@ -385,12 +407,12 @@ def create_date_features(df: pd.DataFrame) -> pd.DataFrame:
     df["issue_quarter"] = df["issue_d"].dt.to_period("Q").astype(str)
     df["issue_month_year"] = df["issue_d"].dt.strftime("%b-%Y")
     log.info(f"  issue_quarter range: {df['issue_quarter'].min()} – {df['issue_quarter'].max()}")
-    _step(19, "Create issue_quarter, issue_month_year", df)
+    _step(20, "Create issue_quarter, issue_month_year", df)
     return df
 
 
 # ===================================================================
-# STEP 20 — Create curr_paid_late1_flag (for transition matrix)
+# STEP 21 — Create curr_paid_late1_flag (for transition matrix)
 # ===================================================================
 def create_curr_paid_late1_flag(df: pd.DataFrame) -> pd.DataFrame:
     """Flag Current/Fully Paid loans that had late fees > $15 (reached Late 16-30)."""
@@ -402,7 +424,7 @@ def create_curr_paid_late1_flag(df: pd.DataFrame) -> pd.DataFrame:
     df["curr_paid_late1_flag"] = np.where(mask, 1, 0)
     count = df["curr_paid_late1_flag"].sum()
     log.info(f"  curr_paid_late1_flag = 1 for {count:,} loans")
-    _step(20, "Create curr_paid_late1_flag", df)
+    _step(21, "Create curr_paid_late1_flag", df)
     return df
 
 
@@ -482,7 +504,7 @@ def main() -> None:
     df = load_raw_data(RAW_CSV)
     initial_rows = len(df)
 
-    # Clean (steps 1–20, matching CLAUDE.md)
+    # Clean (steps 1–21, matching CLAUDE.md)
     df = drop_non_loan_rows(df)           # Step 1
     df = keep_only_used_columns(df)       # Step 2
     df = convert_interest_rate(df)        # Step 3
@@ -493,16 +515,17 @@ def main() -> None:
     df = drop_policy_loans(df)            # Step 8
     df = reclassify_current_zero_balance(df)  # Step 9
     df = drop_stale_current(df)           # Step 10
-    df = clean_negative_late_fees(df)     # Step 11
-    df = clean_small_late_fees(df)        # Step 12
-    df = create_current_late_fee_flag(df) # Step 13
-    df = reclassify_delinquent_zero_balance(df)  # Step 14
-    df = create_upb_lost(df)              # Step 15
-    df = create_joint_columns(df)         # Step 16
-    df = create_fico_columns(df)          # Step 17
-    df = clean_dti(df)                    # Step 18
-    df = create_date_features(df)         # Step 19
-    df = create_curr_paid_late1_flag(df)  # Step 20
+    df = reclassify_current_feb_2019(df)  # Step 11
+    df = clean_negative_late_fees(df)     # Step 12
+    df = clean_small_late_fees(df)        # Step 13
+    df = create_current_late_fee_flag(df) # Step 14
+    df = reclassify_delinquent_zero_balance(df)  # Step 15
+    df = create_upb_lost(df)              # Step 16
+    df = create_joint_columns(df)         # Step 17
+    df = create_fico_columns(df)          # Step 18
+    df = clean_dti(df)                    # Step 19
+    df = create_date_features(df)         # Step 20
+    df = create_curr_paid_late1_flag(df)  # Step 21
 
     # Summary and export
     print_summary(df, initial_rows)

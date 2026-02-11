@@ -8,6 +8,8 @@ import pytest
 from src.cashflow_engine import (
     compute_pool_assumptions,
     compute_pool_characteristics,
+    compute_implied_cpr,
+    compute_curtailment_rates,
     project_cashflows,
     calculate_irr,
     solve_price,
@@ -137,7 +139,8 @@ class TestComputePoolAssumptions:
         result = compute_pool_assumptions(synthetic_df_all, synthetic_df_active)
         expected_keys = {
             'cdr', 'cumulative_default_rate', 'avg_mdr', 'monthly_mdrs',
-            'cpr', 'loss_severity', 'recovery_rate',
+            'cpr', 'full_payoff_cpr', 'curtailment_smm', 'curtailment_cpr',
+            'curtailment_rates', 'loss_severity', 'recovery_rate',
         }
         assert set(result.keys()) == expected_keys
 
@@ -930,7 +933,7 @@ class TestProjectCashflowsTransition:
 
     def test_cashflow_components(self, all_current_pool_state,
                                  simple_7state_probs, transition_pool_chars):
-        """total_cashflow = interest + sched_principal + prepayments + recoveries."""
+        """total_cashflow = interest + sched_principal + prepayments + curtailments + recoveries."""
         cf = project_cashflows_transition(
             all_current_pool_state, simple_7state_probs,
             0.85, 0.15, transition_pool_chars, 12,
@@ -938,7 +941,8 @@ class TestProjectCashflowsTransition:
 
         for _, row in cf.iterrows():
             expected = (row['interest'] + row['scheduled_principal']
-                        + row['prepayments'] + row['recovery'])
+                        + row['prepayments'] + row['curtailments']
+                        + row['recovery'])
             assert abs(row['total_cashflow'] - expected) < 0.10
 
     def test_zero_defaults_when_no_delinquency(self, all_current_pool_state,
@@ -975,8 +979,9 @@ class TestProjectCashflowsTransition:
 
         expected_cols = [
             'month', 'date', 'beginning_balance', 'interest',
-            'scheduled_principal', 'prepayments', 'defaults', 'loss',
-            'recovery', 'total_principal', 'ending_balance', 'total_cashflow',
+            'scheduled_principal', 'prepayments', 'curtailments',
+            'defaults', 'loss', 'recovery', 'total_principal',
+            'ending_balance', 'total_cashflow',
             'current_upb', 'delinquent_upb', 'late_1_upb', 'late_2_upb',
             'late_3_upb', 'default_upb', 'fully_paid_upb',
         ]
@@ -1105,3 +1110,293 @@ class TestAdjustPrepaymentRates:
         row_sums = current_rows[pct_cols].sum(axis=1)
         for s in row_sums:
             assert abs(s - 1.0) < 1e-6, f"Row sum {s} != 1.0 at CPR=0.9999"
+
+
+# ---------------------------------------------------------------------------
+# Tests for compute_implied_cpr
+# ---------------------------------------------------------------------------
+
+class TestComputeImpliedCpr:
+    """Tests for compute_implied_cpr()."""
+
+    @pytest.fixture
+    def age_probs_simple(self):
+        """Age probs with known Current→Fully Paid rates at ages 10, 20, 30."""
+        return pd.DataFrame([
+            {'age_bucket': 10, 'from_status': 'Current',
+             'to_current_pct': 0.95, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.03,
+             'observation_count': 100},
+            {'age_bucket': 20, 'from_status': 'Current',
+             'to_current_pct': 0.90, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.08,
+             'observation_count': 100},
+            {'age_bucket': 30, 'from_status': 'Current',
+             'to_current_pct': 0.80, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.18,
+             'observation_count': 100},
+        ])
+
+    @pytest.fixture
+    def pool_state_simple(self):
+        """Pool state with known UPB at ages 10, 20, 30."""
+        from src.portfolio_analytics import TRANSITION_STATES_7
+        states = {s: {} for s in TRANSITION_STATES_7}
+        states['Current'] = {10: 1_000_000, 20: 500_000, 30: 200_000}
+        return {
+            'states': states,
+            'total_upb': 1_700_000,
+            'wac': 0.10,
+            'wam': 36,
+            'monthly_payment': 50000,
+        }
+
+    def test_basic_weighted_average(self, age_probs_simple, pool_state_simple):
+        """Verify UPB-weighted average SMM → CPR computation."""
+        result = compute_implied_cpr(age_probs_simple, pool_state_simple)
+        # Expected:
+        # age 10: smm=0.03, upb=1M → 30000
+        # age 20: smm=0.08, upb=500K → 40000
+        # age 30: smm=0.18, upb=200K → 36000
+        # weighted_smm = (30000 + 40000 + 36000) / 1700000 = 106000/1700000 ≈ 0.06235
+        # CPR = 1 - (1 - 0.06235)^12 ≈ 0.5385
+        expected_smm = (0.03 * 1_000_000 + 0.08 * 500_000 + 0.18 * 200_000) / 1_700_000
+        expected_cpr = 1 - (1 - expected_smm) ** 12
+        assert abs(result - expected_cpr) < 1e-6
+
+    def test_returns_float(self, age_probs_simple, pool_state_simple):
+        result = compute_implied_cpr(age_probs_simple, pool_state_simple)
+        assert isinstance(result, float)
+        assert result > 0
+
+    def test_zero_upb_returns_zero(self, age_probs_simple):
+        """Pool with no Current UPB → implied CPR = 0."""
+        from src.portfolio_analytics import TRANSITION_STATES_7
+        states = {s: {} for s in TRANSITION_STATES_7}
+        states['Current'] = {}
+        pool_state = {'states': states, 'total_upb': 0, 'wac': 0, 'wam': 0,
+                      'monthly_payment': 0}
+        result = compute_implied_cpr(age_probs_simple, pool_state)
+        assert result == 0.0
+
+    def test_all_zero_fp_rates_returns_zero(self, pool_state_simple):
+        """All Current→Fully Paid rates = 0 → implied CPR = 0."""
+        age_probs = pd.DataFrame([
+            {'age_bucket': 10, 'from_status': 'Current',
+             'to_current_pct': 0.98, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.0,
+             'observation_count': 100},
+            {'age_bucket': 20, 'from_status': 'Current',
+             'to_current_pct': 0.98, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.0,
+             'observation_count': 100},
+            {'age_bucket': 30, 'from_status': 'Current',
+             'to_current_pct': 0.98, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.0,
+             'observation_count': 100},
+        ])
+        result = compute_implied_cpr(age_probs, pool_state_simple)
+        assert result == 0.0
+
+    def test_age_not_in_probs_uses_nearest(self):
+        """Pool age not in age_probs → uses nearest available age."""
+        from src.portfolio_analytics import TRANSITION_STATES_7
+        age_probs = pd.DataFrame([
+            {'age_bucket': 10, 'from_status': 'Current',
+             'to_current_pct': 0.95, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.05,
+             'observation_count': 100},
+        ])
+        states = {s: {} for s in TRANSITION_STATES_7}
+        # Age 15 not in probs → should use age 10 (nearest downward)
+        states['Current'] = {15: 1_000_000}
+        pool_state = {'states': states, 'total_upb': 1_000_000,
+                      'wac': 0.10, 'wam': 36, 'monthly_payment': 50000}
+        result = compute_implied_cpr(age_probs, pool_state)
+        expected_cpr = 1 - (1 - 0.05) ** 12
+        assert abs(result - expected_cpr) < 1e-6
+
+    def test_age_above_max_uses_max(self):
+        """Pool age above max in age_probs → uses max age."""
+        from src.portfolio_analytics import TRANSITION_STATES_7
+        age_probs = pd.DataFrame([
+            {'age_bucket': 10, 'from_status': 'Current',
+             'to_current_pct': 0.95, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.03,
+             'observation_count': 100},
+            {'age_bucket': 20, 'from_status': 'Current',
+             'to_current_pct': 0.88, 'to_delinquent_0_30_pct': 0.02,
+             'to_late_1_pct': 0.0, 'to_late_2_pct': 0.0, 'to_late_3_pct': 0.0,
+             'to_charged_off_pct': 0.0, 'to_fully_paid_pct': 0.10,
+             'observation_count': 100},
+        ])
+        states = {s: {} for s in TRANSITION_STATES_7}
+        # Age 50 > max of 20 → should use age 20's rate (0.10)
+        states['Current'] = {50: 1_000_000}
+        pool_state = {'states': states, 'total_upb': 1_000_000,
+                      'wac': 0.10, 'wam': 36, 'monthly_payment': 50000}
+        result = compute_implied_cpr(age_probs, pool_state)
+        expected_cpr = 1 - (1 - 0.10) ** 12
+        assert abs(result - expected_cpr) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# compute_curtailment_rates
+# ---------------------------------------------------------------------------
+
+class TestComputeCurtailmentRates:
+
+    def test_returns_dict_with_expected_ages(self):
+        """Returns dict keyed by loan age."""
+        df = pd.DataFrame({
+            'loan_age_months': [10, 10, 20, 20],
+            'last_pmt_beginning_balance': [10000.0, 10000.0, 8000.0, 8000.0],
+            'last_pmt_scheduled_principal': [200.0, 200.0, 250.0, 250.0],
+            'last_pmt_unscheduled_principal': [100.0, 100.0, 50.0, 50.0],
+        })
+        result = compute_curtailment_rates(df)
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {10, 20}
+
+    def test_rates_in_valid_range(self):
+        """All rates should be in [0, 1]."""
+        df = pd.DataFrame({
+            'loan_age_months': [5, 10, 15],
+            'last_pmt_beginning_balance': [10000.0, 8000.0, 6000.0],
+            'last_pmt_scheduled_principal': [200.0, 250.0, 300.0],
+            'last_pmt_unscheduled_principal': [100.0, 50.0, 200.0],
+        })
+        result = compute_curtailment_rates(df)
+        for age, rate in result.items():
+            assert 0.0 <= rate <= 1.0, f"Rate {rate} at age {age} out of range"
+
+    def test_known_curtailment(self):
+        """$100 unscheduled on $10K balance after $200 sched → SMM ≈ 100/9800 ≈ 1.02%."""
+        df = pd.DataFrame({
+            'loan_age_months': [10, 10],
+            'last_pmt_beginning_balance': [10000.0, 10000.0],
+            'last_pmt_scheduled_principal': [200.0, 200.0],
+            'last_pmt_unscheduled_principal': [100.0, 100.0],
+        })
+        result = compute_curtailment_rates(df)
+        # numerator = 200, denominator = 20000 - 400 = 19600
+        expected_smm = 200.0 / 19600.0
+        assert abs(result[10] - expected_smm) < 1e-6
+
+    def test_zero_curtailment(self):
+        """Loans with no unscheduled principal → SMM = 0."""
+        df = pd.DataFrame({
+            'loan_age_months': [10, 10],
+            'last_pmt_beginning_balance': [10000.0, 10000.0],
+            'last_pmt_scheduled_principal': [200.0, 200.0],
+            'last_pmt_unscheduled_principal': [0.0, 0.0],
+        })
+        result = compute_curtailment_rates(df)
+        assert result[10] == 0.0
+
+    def test_empty_dataframe(self):
+        """Empty DataFrame → empty dict."""
+        df = pd.DataFrame({
+            'loan_age_months': pd.Series(dtype='int64'),
+            'last_pmt_beginning_balance': pd.Series(dtype='float64'),
+            'last_pmt_scheduled_principal': pd.Series(dtype='float64'),
+            'last_pmt_unscheduled_principal': pd.Series(dtype='float64'),
+        })
+        result = compute_curtailment_rates(df)
+        assert result == {}
+
+    def test_missing_columns(self):
+        """Missing required columns → returns empty dict."""
+        df = pd.DataFrame({'loan_age_months': [10]})
+        result = compute_curtailment_rates(df)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# project_cashflows_transition with curtailments
+# ---------------------------------------------------------------------------
+
+class TestProjectCashflowsTransitionCurtailments:
+
+    def test_none_curtailments_backward_compat(self, all_current_pool_state,
+                                                simple_7state_probs,
+                                                transition_pool_chars):
+        """curtailment_rates=None → curtailments column all zero."""
+        cf = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 12,
+            curtailment_rates=None,
+        )
+        assert (cf['curtailments'] == 0.0).all()
+
+    def test_curtailments_lower_balance(self, all_current_pool_state,
+                                        simple_7state_probs,
+                                        transition_pool_chars):
+        """With curtailment_rates, ending balance should be lower than without."""
+        cf_no_curt = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 20,
+            curtailment_rates=None,
+        )
+        # 1% curtailment at all ages
+        curt_rates = {a: 0.01 for a in range(60)}
+        cf_with_curt = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 20,
+            curtailment_rates=curt_rates,
+        )
+        # At month 10, balance with curtailments should be lower
+        bal_no = cf_no_curt[cf_no_curt['month'] == 10]['ending_balance'].values[0]
+        bal_with = cf_with_curt[cf_with_curt['month'] == 10]['ending_balance'].values[0]
+        assert bal_with < bal_no
+
+    def test_curtailments_increase_total_principal(self, all_current_pool_state,
+                                                    simple_7state_probs,
+                                                    transition_pool_chars):
+        """With curtailments, total_principal should be higher."""
+        cf_no_curt = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 20,
+            curtailment_rates=None,
+        )
+        curt_rates = {a: 0.01 for a in range(60)}
+        cf_with_curt = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 20,
+            curtailment_rates=curt_rates,
+        )
+        assert cf_with_curt['total_principal'].sum() > cf_no_curt['total_principal'].sum()
+
+    def test_curtailments_positive_values(self, all_current_pool_state,
+                                           simple_7state_probs,
+                                           transition_pool_chars):
+        """With non-zero curtailment rates, curtailments column should have positive values."""
+        curt_rates = {a: 0.02 for a in range(60)}
+        cf = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 12,
+            curtailment_rates=curt_rates,
+        )
+        assert cf['curtailments'].sum() > 0
+
+    def test_total_principal_includes_curtailments(self, all_current_pool_state,
+                                                    simple_7state_probs,
+                                                    transition_pool_chars):
+        """total_principal = scheduled_principal + prepayments + curtailments."""
+        curt_rates = {a: 0.01 for a in range(60)}
+        cf = project_cashflows_transition(
+            all_current_pool_state, simple_7state_probs,
+            0.85, 0.15, transition_pool_chars, 12,
+            curtailment_rates=curt_rates,
+        )
+        for _, row in cf.iterrows():
+            expected = row['scheduled_principal'] + row['prepayments'] + row['curtailments']
+            assert abs(row['total_principal'] - expected) < 0.10

@@ -81,14 +81,14 @@ python scripts/export_to_sqlite.py
 pytest tests/ -v
 ```
 
-The test suite contains 174 tests across 4 modules:
+The test suite contains 209 tests across 4 modules:
 
 | Test File | Tests | Coverage |
 |-----------|------:|----------|
 | `test_amortization.py` | 19 | Monthly payment, balance, payment count, full calc_amort |
 | `test_portfolio_analytics.py` | 72 | Credit metrics, performance metrics, transition matrix, 7-state transitions, late sub-states |
-| `test_cashflow_engine.py` | 48 | Pool assumptions, characteristics, cash flows, IRR, price solver, state-transition engine |
-| `test_scenario_analysis.py` | 35 | Base assumptions, scenario builder, scenario comparison, transition scenarios |
+| `test_cashflow_engine.py` | 77 | Pool assumptions, characteristics, cash flows, IRR, price solver, state-transition engine, implied CPR, curtailment rates, curtailments in projections |
+| `test_scenario_analysis.py` | 54 | Base assumptions, scenario builder, scenario comparison, transition scenarios, vintage percentiles, percentile-based scenarios, scenario curtailments |
 
 All tests use synthetic data fixtures and run independently of the database.
 
@@ -138,7 +138,7 @@ After selecting a Strata Type, this dropdown populates with all available values
 
 When Strata Type is set to "ALL", this dropdown is disabled.
 
-Purchase Price and Stress/Upside % controls live on their respective tabs (Tab 2 and Tab 3).
+Purchase Price controls live on their respective tabs (Tab 2 and Tab 3). Tab 3 also has editable CDR/CPR scenario inputs.
 
 #### Sidebar Summary
 
@@ -260,16 +260,19 @@ This tab projects monthly cash flows using the state-transition model and comput
 
 #### Base Assumptions (Metric Cards)
 
-Six cards showing the computed base-case assumptions:
+Cards showing the computed base-case assumptions:
 
 | Metric | Source |
 |--------|--------|
 | CDR (Conditional) | Annualized from trailing 12-month average MDR (all loans in filter) |
 | Avg MDR | Un-annualized monthly default rate |
-| CPR | From Current + Fully Paid loans with March 2019 last payment (pool-level SMM annualized). Delinquent loans excluded — they are behind on payments, not prepaying. |
+| Full Payoff CPR | CPR from Fully Paid March 2019 loans only (full loan payoffs) |
+| Curtailment CPR | CPR from Current loans' partial prepayments above scheduled installment |
 | Loss Severity | From Charged Off loans with capped recoveries |
 | Recovery Rate | 1 - Loss Severity |
 | Cumulative Default Rate | Raw lifetime rate (reference only, NOT used in projections) |
+
+Total CPR (full payoffs + curtailments combined) shown as caption.
 
 #### Pool Characteristics (Metric Cards)
 
@@ -284,7 +287,7 @@ Four cards showing the pool being modeled:
 
 #### State-Transition Projection
 
-**Projection Input**: Purchase Price (%) only. No CDR/CPR inputs — defaults and prepayments are driven entirely by age-specific empirical transition probabilities.
+**Projection Input**: Purchase Price (%) only. No CDR/CPR inputs — defaults and prepayments are driven entirely by age-specific empirical transition probabilities. Prepayment rates use the observed age-specific Current→Fully Paid rates directly, preserving the natural variation across loan ages. **Curtailments** (partial prepayments from loans that stay Current) are also applied at age-specific rates computed from Current loans' observed extra payments.
 
 **How it works**: The pool is tracked across 7 states (Current, Delinquent (0-30), Late_1, Late_2, Late_3, Charged Off, Fully Paid). Each month, loan balances transition between states based on age-specific probabilities derived from the dataset. Defaults flow through a 5-month pipeline:
 
@@ -310,42 +313,56 @@ A stacked bar chart showing the composition of monthly cash flows, with a toggle
 |-----------|-------|---------|
 | Interest | Blue (#4A90D9) | Interest earned on performing balance |
 | Scheduled Principal | Orange (#E67E22) | Regular amortization principal |
-| Prepayments | Green (#2ECC71) | Voluntary prepayment principal |
+| Full Payoffs | Green (#2ECC71) | Full prepayment principal (Current→Fully Paid) |
+| Curtailments | Teal (#1ABC9C) | Partial prepayments above scheduled installment |
 | Recoveries | Purple (#9B59B6) | Post-default recoveries |
 
 An overlay line shows the ending balance on a secondary y-axis (hidden in % mode).
 
 #### Full Cash Flow Table (Expandable)
 
-Click "View Full Cash Flow Table" to see the complete month-by-month projection with all columns: month, date, beginning balance, defaults, loss, recovery, interest, scheduled principal, prepayments, total principal, ending balance, total cashflow.
+Click "View Full Cash Flow Table" to see the complete month-by-month projection with all columns: month, date, beginning balance, defaults, loss, recovery, interest, scheduled principal, prepayments, curtailments, total principal, ending balance, total cashflow.
 
 ---
 
 ### Tab 3: Scenario Analysis
 
-This tab compares investment returns under three scenarios: Base, Stress, and Upside. Scenarios shift the state-transition probabilities to model credit deterioration or improvement.
+This tab compares investment returns under three scenarios: Base, Stress, and Upside. Scenarios are grounded in empirical vintage-level CDR/CPR variation, not arbitrary sliders.
 
 #### Tab 3 Controls
 
 - **Purchase Price (%)**: Sets the purchase price for scenario IRR calculations (default 95%)
-- **Stress / Upside %**: Slider controlling the multiplicative shift (range 5%-50%, default 15%)
+- **Editable CDR/CPR Table**: 3 rows (Base, Stress, Upside) × 2 columns (CDR %, CPR %). Base pre-populated from pool-level empirical values; Stress/Upside from P25/P75 vintage percentiles. Users can override any value.
 
-#### Scenario Construction
+#### Vintage Percentile Methodology
 
-Scenarios shift the transition probabilities rather than CDR/CPR:
+For each quarterly vintage in the current filter with >= 1,000 loans, the tool computes vintage-specific CDR and CPR. CDR and CPR have separate qualifying vintage counts (a vintage with many loans but no March 2019 Current/Fully Paid loans qualifies for CDR but not CPR). Unweighted P25/P75 percentiles across qualifying vintages determine the stress/upside scenario values:
 
-**Stress logic** (per row of the transition matrix):
-- Current→Delinquent probability x (1 + pct) — more delinquency
-- Current→Fully Paid probability x (1 - pct) — less prepayment
-- All cure rates (non-Current → Current) x (1 - pct) — harder to cure
-- Late_3→Charged Off is NOT directly stressed — increases mechanically via re-normalization
-- After multipliers: clamp all probabilities to [0, 1], then adjust residual column to make each row sum to 1
+| Scenario | CDR | CPR |
+|----------|-----|-----|
+| Base | Pool-level empirical | Pool-level empirical |
+| Stress | P75 (high defaults) | P25 (low prepayments) |
+| Upside | P25 (low defaults) | P75 (high prepayments) |
 
-**Upside logic**: opposite multipliers.
+Base uses the pool-level CDR/CPR from `compute_pool_assumptions()`, which reflects the actual cohort behavior with proper weighting. Percentiles characterize the cross-vintage distribution for stress/upside bounds.
+
+The caption below the inputs shows how many CDR and CPR vintages qualified. An expander reveals the per-vintage CDR/CPR distribution table.
+
+**Fallback**: If fewer than 3 qualifying CDR vintages exist (e.g., very narrow filter), the tool warns and pre-populates with pool-level CDR/CPR ± 15%.
+
+#### How CDR/CPR Drive Transition Probabilities
+
+The scenario CDR scales the delinquency entry rate and cure rates in the transition matrix:
+- `cdr_ratio = scenario_cdr / pool_cdr`
+- Current→Delinquent rate scaled up/down by the CDR ratio
+- Cure rates inversely scaled
+- Late_3→Charged Off increases mechanically via re-normalization (not directly scaled)
+
+Each scenario's CPR scales the age-specific Current→Fully Paid rates via a ratio (`cpr_ratio = scenario_cpr / base_cpr`), preserving the natural age-dependent prepayment shape while shifting the overall level. Curtailment rates are also scaled by the same ratio.
 
 **Loss severity**: FIXED across all scenarios.
 
-**Scenario Comparison Table**: One row per scenario with columns for loss severity, IRR, total interest/principal/losses/recoveries/defaults, and WAL.
+**Scenario Comparison Table**: One row per scenario with columns for CDR, CPR, loss severity, IRR, total interest/principal/losses/recoveries/defaults, and WAL.
 
 **Projected Balance by Scenario**: Multi-line chart showing the pool balance over time for each scenario.
 
@@ -365,8 +382,8 @@ The height difference between Stress and Base shows downside risk. The differenc
 |--------|-----------|---------|
 | `amortization.py` | `calc_amort`, `calc_monthly_payment`, `calc_balance`, `calc_payment_num` | Loan-level amortization calculations. Adds ~20 runtime columns to the DataFrame. |
 | `portfolio_analytics.py` | `calculate_credit_metrics`, `calculate_performance_metrics`, `calculate_transition_matrix`, `reconstruct_loan_timeline`, `get_loan_status_at_age`, `compute_age_transition_probabilities`, `compute_pool_transition_matrix`, `compute_default_timing`, `compute_loan_age_status_matrix` | Pool stratification, vintage performance, delinquency transition flows, age-specific transition probabilities (5-state and 7-state). |
-| `cashflow_engine.py` | `compute_pool_assumptions`, `compute_pool_characteristics`, `calculate_irr`, `build_pool_state`, `project_cashflows_transition`, `solve_price_transition` | Pool-level cash flow projection engine (state-transition model), IRR, and price solver. Also contains `project_cashflows` and `solve_price` (flat CDR/CPR model, available but not used in dashboard). |
-| `scenario_analysis.py` | `compute_base_assumptions`, `build_scenarios_transition`, `compare_scenarios_transition` | Base/stress/upside scenario builder using transition probability shifts. Also contains `build_scenarios` and `compare_scenarios` (flat CDR/CPR model, available but not used in dashboard). |
+| `cashflow_engine.py` | `compute_pool_assumptions`, `compute_pool_characteristics`, `compute_implied_cpr`, `compute_curtailment_rates`, `calculate_irr`, `build_pool_state`, `project_cashflows_transition`, `solve_price_transition` | Pool-level cash flow projection engine (state-transition model), CPR split (full payoff + curtailment), age-specific curtailment rates, IRR, and price solver. Also contains `project_cashflows`, `solve_price`, and `adjust_prepayment_rates` (flat CDR/CPR model, available but not used in dashboard). |
+| `scenario_analysis.py` | `compute_base_assumptions`, `compute_vintage_percentiles`, `build_scenarios_transition`, `build_scenarios_from_percentiles`, `compare_scenarios_transition` | Vintage percentile analysis, base/stress/upside scenario builder using percentile-derived CDR/CPR with ratio scaling. Also contains `build_scenarios` and `compare_scenarios` (flat CDR/CPR model, available but not used in dashboard). |
 
 ### Data Pipeline
 
@@ -392,7 +409,8 @@ Raw CSV → export_to_sqlite.py → loans.db → app.py (load_data) → calc_amo
                                               │   calculate_irr()                        │
                                               ├──────────────────────────────────────────┤
                                               │ Tab 3: Scenario Analysis                 │
-                                              │   build_scenarios_transition()           │
+                                              │   compute_vintage_percentiles()          │
+                                              │   build_scenarios_from_percentiles()     │
                                               │   compare_scenarios_transition()         │
                                               └──────────────────────────────────────────┘
 ```
@@ -431,9 +449,9 @@ Understanding which loans feed into which calculations is critical:
 
 1. Select your pool
 2. Go to Tab 3
-3. Start with the default 15% stress/upside shift
+3. Review the pre-populated CDR/CPR values derived from vintage percentiles
 4. Observe the IRR spread between Stress and Base scenarios
-5. Increase the stress % to see how much the IRR degrades
+5. Manually increase the Stress CDR or decrease the Stress CPR to test more extreme scenarios
 6. A wider spread indicates more sensitivity to credit deterioration
 
 ### Comparing Grades

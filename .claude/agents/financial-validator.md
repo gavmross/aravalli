@@ -470,14 +470,20 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 - Current cannot jump directly to Late_1, Late_2, Late_3, or Charged Off
 - Verify `to_late_1_pct`, `to_late_2_pct`, `to_late_3_pct`, `to_charged_off_pct` are 0 for `from_status = Current`
 
-**Prepayment rate override** — `adjust_prepayment_rates()`:
-- `adjust_prepayment_rates(age_probs, cpr)` replaces Current→Fully Paid with CPR-derived SMM
-- SMM = 1 - (1 - CPR)^(1/12). Example: CPR = 0.0149 → SMM ≈ 0.00125
-- After adjustment: all Current rows have `to_fully_paid_pct` = SMM (constant across ages)
+**Empirical age-specific prepayment rates** (replaces flat CPR override):
+- `adjust_prepayment_rates()` is DEPRECATED — it is NOT called in the dashboard pipeline
+- The empirical Current→Fully Paid rates from `compute_age_transition_probabilities(bucket_size=1, states='7state')` are used directly
+- Verify: Current→Fully Paid rates VARY by age (not constant across all age buckets)
+- Verify: older loan ages have higher Current→Fully Paid rates than younger ages (age-dependent prepayment)
 - Non-Current rows are unchanged
-- Current rows still sum to 1.0
-- Delinquency rates (Current→Delinquent) are NOT affected by the CPR adjustment
-- Verify prepayments in month 1 ≈ total_current_upb × SMM (not empirical rate)
+- Current rows still sum to 1.0 at every age bucket
+
+**Implied CPR** — `compute_implied_cpr()`:
+- Computes UPB-weighted average SMM from age-specific Current→Fully Paid rates
+- Weights are the pool's actual UPB at each age from `build_pool_state()`
+- Converts weighted average SMM → annual CPR: `CPR = 1 - (1 - weighted_avg_smm)^12`
+- Result should be > 0 if any loans are prepaying
+- Result should be in reasonable range (0% to ~40% for consumer credit)
 
 **Notional balance / payment scaling**:
 - `fraction = current_upb / notional_upb`
@@ -491,7 +497,9 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 - Output of `project_cashflows_transition()` works with `calculate_irr()`
 - `solve_price_transition()` round-trip: solved price produces target IRR within 1e-4
 
-### Step 17: Transition Scenario Checks — `build_scenarios_transition()`
+### Step 17: Transition Scenario Checks — `build_scenarios_transition()` (LEGACY)
+
+Note: `build_scenarios_transition()` is retained in the codebase but is NO LONGER used by the dashboard. The dashboard uses `build_scenarios_from_percentiles()` instead (see Steps 18-19). These checks validate the legacy function still works correctly for backward compatibility.
 
 - Base probs unchanged after `build_scenarios_transition()`
 - Stress: Current→Delinquent increases, all cure rates decrease
@@ -509,7 +517,64 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 - Late_3: residual = `to_charged_off_pct`
 - Verify: `residual_col = 1.0 − sum(all other pct cols)`, clamped to [0, 1]
 
-### Step 18: WAL Computation — `compare_scenarios()`, `compare_scenarios_transition()`
+### Step 18: Vintage Percentile Checks — `compute_vintage_percentiles()`
+
+**Per-vintage CDR computation**:
+- Each quarterly vintage (grouped by `issue_quarter`) produces one CDR observation
+- CDR per vintage uses the exact same trailing 12-month MDR methodology as `compute_pool_assumptions()`
+- Vintages with < 1000 loans are excluded (`min_loans_cdr=1000`)
+- Verify: number of qualifying vintages is reasonable (expect 20-40 for broad filters, fewer for narrow)
+- Verify: CDR values per vintage are non-negative and ≤ 1.0
+- Verify: P25 ≤ P50 ≤ P75 (monotonic percentiles)
+
+**Per-vintage CPR computation**:
+- Each quarterly vintage produces one CPR observation from Current + Fully Paid March 2019 loans
+- Same SMM→CPR math as pool-level computation
+- Vintages with < 1000 qualifying loans are excluded (`min_loans_cpr=1000`)
+- Verify: CPR values per vintage are non-negative
+- Verify: P25 ≤ P50 ≤ P75
+
+**Scenario mapping**:
+- Base CDR/CPR = pool-level empirical values from `compute_pool_assumptions()` (NOT P50 median)
+- Stress = P75 CDR + P25 CPR
+- Upside = P25 CDR + P75 CPR
+- Loss severity FIXED across all scenarios
+
+**Fallback behavior**:
+- If < 3 qualifying CDR vintages: all scenarios use pool-level values
+- A warning flag (`fallback=True`) is returned in the output dict
+
+### Step 19: Percentile-Based Scenario Checks — `build_scenarios_from_percentiles()`
+
+**CDR ratio scaling**:
+- `cdr_ratio = scenario_cdr / pool_cdr`
+- Current→Delinquent probability multiplied by `cdr_ratio` at every age
+- Cure rates (to_current_pct from non-Current states) multiplied by `1 / cdr_ratio`
+- Late_3→Charged Off NOT directly scaled (increases via re-normalization only)
+- All rows sum to 1.0 after re-normalization
+- Verify: Stress scenario has higher Current→Delinquent and lower cure rates than Base
+- Verify: Upside scenario has lower Current→Delinquent and higher cure rates than Base
+
+**CPR ratio scaling**:
+- `cpr_ratio = scenario_cpr / base_implied_cpr` (from `compute_implied_cpr()`)
+- Current→Fully Paid probability multiplied by `cpr_ratio` at every age
+- Age-dependent shape is preserved (relative differences between ages maintained)
+- Verify: Stress scenario has lower Current→Fully Paid at all ages than Base
+- Verify: Upside scenario has higher Current→Fully Paid at all ages than Base
+
+**Re-normalization residual column mapping** (same as Step 17):
+- Current: residual = `to_current_pct`
+- Delinquent (0-30): residual = `to_late_1_pct`
+- Late_1: residual = `to_late_2_pct`
+- Late_2: residual = `to_late_3_pct`
+- Late_3: residual = `to_charged_off_pct`
+
+**Edge cases**:
+- If `pool_cdr == 0`: CDR scaling is skipped, transitions unchanged for CDR dimension
+- If `base_implied_cpr == 0`: CPR scaling is skipped, transitions unchanged for CPR dimension
+- Scenario IRR ordering: Stress < Base < Upside (must still hold)
+
+### Step 20: WAL Computation — `compare_scenarios_transition()`
 
 **Weighted Average Life**:
 - WAL = Σ(month × total_principal) / Σ(total_principal) / 12
@@ -518,7 +583,7 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 - Must be < WAM/12 (can't exceed max maturity in years)
 - Expected ordering: Stress WAL > Base WAL > Upside WAL (slower prepayments extend life)
 
-### Step 19: Credit Metrics — `calculate_credit_metrics()`
+### Step 21: Credit Metrics — `calculate_credit_metrics()`
 
 **Original metrics (weighted by funded_amnt)**:
 - orig_wac = Σ(int_rate × funded_amnt) / Σ funded_amnt
@@ -543,7 +608,7 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 - ALL row must be present
 - orig_loan_count for ALL must equal sum of all strata rows' orig_loan_count
 
-### Step 20: Performance Metrics — `calculate_performance_metrics()`
+### Step 22: Performance Metrics — `calculate_performance_metrics()`
 
 **Per-vintage status percentages**:
 - pct_active + pct_fully_paid + pct_charged_off ≤ 1.0 (may not sum to exactly 1.0 if there are 'Default' status loans)
@@ -561,7 +626,7 @@ assert abs(chars['monthly_payment'] - df_current['installment'].sum()) < 1.0
 **Loss severity / recovery identity**:
 - loss_severity + recovery_rate = 1.0 for each vintage with Charged Off loans
 
-### Step 21: Transition Matrix — `calculate_transition_matrix()`
+### Step 23: Transition Matrix — `calculate_transition_matrix()`
 
 **Flow probabilities sum correctly at each stage**:
 - from_current_to_fully_paid_clean + from_current_to_current_clean + from_current_to_delinquent = 1.0
@@ -589,7 +654,7 @@ for _, row in tm.iterrows():
     assert abs(late31_sum - 1.0) < 1e-6, f"Late31 flow doesn't sum to 1: {late31_sum}"
 ```
 
-### Step 22: Run pytest
+### Step 24: Run pytest
 
 ```bash
 source .env/bin/activate
@@ -618,9 +683,12 @@ Pool Characteristics:           ✓ PASS / ✗ FAIL (details)
 Cash Flow Engine (simple):      ✓ PASS / ✗ FAIL (details)
 IRR Calculation:                ✓ PASS / ✗ FAIL (details)
 Price Solver:                   ✓ PASS / ✗ FAIL (details)
-Scenario Multipliers:           ✓ PASS / ✗ FAIL (details)
+Scenario Multipliers (legacy):  ✓ PASS / ✗ FAIL (details)
 State-Transition Model:         ✓ PASS / ✗ FAIL (details)
-Transition Scenarios:           ✓ PASS / ✗ FAIL (details)
+Transition Scenarios (legacy):  ✓ PASS / ✗ FAIL (details)
+Implied CPR:                    ✓ PASS / ✗ FAIL (details)
+Vintage Percentiles:            ✓ PASS / ✗ FAIL (details)
+Percentile-Based Scenarios:     ✓ PASS / ✗ FAIL (details)
 WAL Computation:                ✓ PASS / ✗ FAIL (details)
 Credit Metrics:                 ✓ PASS / ✗ FAIL (details)
 Performance Metrics:            ✓ PASS / ✗ FAIL (details)

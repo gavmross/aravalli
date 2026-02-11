@@ -7,7 +7,7 @@ Interactive Streamlit dashboard for analyzing a portfolio of ~2.2M Lending Club 
 Three functional parts:
 1. **Portfolio Analytics** — Pool stratifications, credit metrics, performance metrics, delinquency transitions
 2. **Cash Flow Projection & IRR** — Monthly projected cash flows at pool level, IRR at a purchase price, price solver for target IRR
-3. **Scenario Analysis** — Base/stress/upside comparison with user-adjustable multiplicative shifts
+3. **Scenario Analysis** — Base/stress/upside comparison with empirically grounded CDR/CPR from quarterly vintage percentiles, user-adjustable
 
 All three parts surface through a single Streamlit app (`app.py`) with sidebar filters and three tabs.
 
@@ -208,12 +208,14 @@ These are display-only, do NOT feed into the cash flow engine. They use only bas
 ### Cash Flow Functions (in `src/cashflow_engine.py`)
 
 **Dashboard-active (used by `app.py`)**:
-- `compute_pool_assumptions(df_all, df_active) → dict` — Base-case CDR (conditional, 12-month trailing average MDR, annualized via dv01 methodology), CPR, loss severity. Requires `reconstruct_loan_timeline()` to have been called on `df_all` first (for `default_month` and `payoff_month` columns). Returns `{'cdr': float, 'cumulative_default_rate': float, 'avg_mdr': float, 'monthly_mdrs': list[float], 'cpr': float, 'loss_severity': float, 'recovery_rate': float}`.
+- `compute_pool_assumptions(df_all, df_active) → dict` — Base-case CDR (conditional, 12-month trailing average MDR, annualized via dv01 methodology), CPR (split into full payoff + curtailment), loss severity, age-specific curtailment rates. Requires `reconstruct_loan_timeline()` to have been called on `df_all` first (for `default_month` and `payoff_month` columns). Returns `{'cdr': float, 'cumulative_default_rate': float, 'avg_mdr': float, 'monthly_mdrs': list[float], 'cpr': float, 'full_payoff_cpr': float, 'curtailment_smm': float, 'curtailment_cpr': float, 'curtailment_rates': dict[int,float], 'loss_severity': float, 'recovery_rate': float}`.
+- `compute_implied_cpr(age_probs, pool_state) → float` — Computes pool-level implied CPR from age-specific Current→Fully Paid rates, weighted by UPB at each age. Retained for reference/testing; pool-level CPR is now used as the scenario scaling denominator.
+- `compute_curtailment_rates(df_current) → dict[int, float]` — Age-specific curtailment SMM from Current loans' observed partial prepayments. Returns `{age: smm}`. Used by `project_cashflows_transition()` to apply curtailments.
 - `compute_pool_characteristics(df_active) → dict` — Pool aggregates: {total_upb, wac, wam, monthly_payment}.
 - `calculate_irr(cashflows_df, pool_chars, purchase_price) → float` — Annualized IRR from projected cash flows.
 - `build_pool_state(df, include_statuses=None) → dict` — Constructs initial pool state from loan DataFrame for state-transition model. Maps LC statuses to 7 model states. Returns `{'states': {state: {age: upb}}, 'total_upb', 'wac', 'wam', 'monthly_payment'}`.
-- `project_cashflows_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months) → pd.DataFrame` — State-transition monthly projection. Tracks UPB across 7 states with age-specific transition probabilities. Returns columns compatible with `calculate_irr()` plus state-specific UPB columns.
-- `solve_price_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months, target_irr) → float|None` — Brentq solver for transition model. Projects once (price-independent), then solves for price.
+- `project_cashflows_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months, curtailment_rates=None) → pd.DataFrame` — State-transition monthly projection. Tracks UPB across 7 states with age-specific transition probabilities. Applies curtailments (partial prepayments) when `curtailment_rates` dict is provided. Returns columns compatible with `calculate_irr()` plus `curtailments` column and state-specific UPB columns.
+- `solve_price_transition(pool_state, age_probs, loss_severity, recovery_rate, pool_chars, num_months, target_irr, curtailment_rates=None) → float|None` — Brentq solver for transition model. Projects once (price-independent), then solves for price. Passes `curtailment_rates` through to projection.
 
 **Codebase-only (not used by dashboard, retained for reference/testing)**:
 - `project_cashflows(pool_chars, cdr, cpr, loss_severity, purchase_price) → pd.DataFrame` — Flat CDR/CPR monthly projection loop.
@@ -222,11 +224,13 @@ These are display-only, do NOT feed into the cash flow engine. They use only bas
 ### Scenario Functions (in `src/scenario_analysis.py`)
 
 **Dashboard-active**:
-- `compute_base_assumptions(df_all, df_active) → dict` — Wrapper for compute_pool_assumptions.
-- `build_scenarios_transition(base_probs, stress_pct=0.15, upside_pct=0.15) → dict` — Applies multiplicative shifts to transition probabilities. Stress: increases delinquency, decreases cure rates. Late_3→Default NOT directly stressed. Returns `{'Base', 'Stress', 'Upside'}` probability DataFrames.
-- `compare_scenarios_transition(pool_state, scenario_probs, loss_severity, recovery_rate, pool_chars, num_months, purchase_price) → pd.DataFrame` — Runs transition projections + IRR for each scenario.
+- `compute_vintage_percentiles(df_all, df_active, pool_assumptions, min_loans_cdr=1000, min_loans_cpr=1000) → dict` — Per-vintage CDR/CPR computation with P25/P50/P75 percentiles for scenario analysis. Base uses pool-level empirical CDR/CPR (not P50). Returns `{'fallback': bool, 'vintage_cdrs': list, 'vintage_cprs': list, 'n_cdr_vintages': int, 'n_cpr_vintages': int, 'percentiles': dict|None, 'scenarios': dict|None, 'vintage_data': pd.DataFrame}`.
+- `build_scenarios_from_percentiles(raw_age_probs, pool_cdr, base_cpr, scenario_cdrs, scenario_cprs) → dict` — Scales transition probabilities by CDR ratio and CPR ratio on age-specific rates. Takes RAW age probs (empirical rates). `base_cpr` is pool-level CPR (full payoffs + curtailments). Returns `{'Base', 'Stress', 'Upside'}` probability DataFrames.
+- `compare_scenarios_transition(pool_state, scenario_probs, loss_severity, recovery_rate, pool_chars, num_months, purchase_price, scenario_curtailment_rates=None) → pd.DataFrame` — Runs transition projections + IRR for each scenario. Per-scenario curtailment rates scaled by CPR ratio.
 
 **Codebase-only (not used by dashboard, retained for reference/testing)**:
+- `compute_base_assumptions(df_all, df_active) → dict` — Wrapper for compute_pool_assumptions.
+- `build_scenarios_transition(base_probs, stress_pct=0.15, upside_pct=0.15) → dict` — Applies multiplicative shifts to transition probabilities. Stress: increases delinquency, decreases cure rates. Late_3→Default NOT directly stressed. Returns `{'Base', 'Stress', 'Upside'}` probability DataFrames.
 - `build_scenarios(base_assumptions, stress_pct=0.15, upside_pct=0.15) → dict` — Multiplicative CDR/CPR shifts for flat model.
 - `compare_scenarios(pool_chars, scenarios, purchase_price) → pd.DataFrame` — Runs flat projections + IRR for each scenario.
 
@@ -253,7 +257,7 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 2. Run `calc_amort()` on filtered data
 3. Tab 1 uses ALL loans; Tabs 2 & 3 use all active loans: Current with `last_pymnt_d == 2019-03-01` plus all delinquent (In Grace + Late 16-30 + Late 31-120 regardless of last payment date)
 4. CDR from ALL loans; CPR from Current + Fully Paid loans with March 2019 last payment date (delinquent loans don't prepay); Loss severity from Charged Off subset
-5. Tab 2 has purchase price input; Tab 3 has own price + stress/upside % slider
+5. Tab 2 has purchase price input; Tab 3 has own price + editable CDR/CPR scenario inputs
 
 ### Tab 1: Portfolio Metrics
 - Credit metrics, performance metrics, transition matrix tables (existing functions)
@@ -265,13 +269,17 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - Computed base assumptions as metric cards (CDR, Avg MDR, CPR, Loss Severity, Recovery Rate, Cumulative Default Rate)
 - Pool characteristics as metric cards
 - Purchase Price (%) input only — no CDR/CPR inputs (driven by transition probabilities)
+- Uses empirical age-specific prepayment rates directly (not flat CPR override). The displayed CPR is a summary statistic only.
 - Uses `build_pool_state()` + `project_cashflows_transition()` + `solve_price_transition()`
 - UPB-by-state stacked area chart, IRR display, price solver, monthly cash flow chart, expandable monthly table
 
-### Tab 3: Scenario Comparison (State-Transition)
-- Own Purchase Price (%), Stress/Upside % slider
-- Uses `build_scenarios_transition()` + `compare_scenarios_transition()`
-- Scenario comparison table + multi-line balance chart by scenario
+### Tab 3: Scenario Comparison (Percentile-Based)
+- Purchase Price (%), editable CDR/CPR table pre-populated from quarterly vintage percentiles (Base = pool-level empirical, Stress = P75 CDR + P25 CPR, Upside = P25 CDR + P75 CPR)
+- Uses `compute_vintage_percentiles()` + `build_scenarios_from_percentiles()` + `compare_scenarios_transition()`
+- CDR scenario adjustment: ratio-scales Current→Delinquent and cure rates. CPR scenario adjustment: ratio-scales age-specific Current→Fully Paid rates (preserves age-dependent shape)
+- Fallback warning if < 3 qualifying vintages (uses pool-level CDR/CPR ± 15%)
+- Vintage CDR/CPR distribution table in expander
+- Scenario comparison table (with CDR/CPR columns) + multi-line balance chart by scenario
 
 ---
 
@@ -288,7 +296,7 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 
 - `pytest tests/ -v` from project root
 - Test files mirror src modules. See `tests/test_*.py` for all test cases.
-- All 186 tests currently pass (72 portfolio_analytics, 60 cashflow_engine, 35 scenario_analysis, 19 amortization).
+- All 222 tests currently pass (72 portfolio_analytics, 77 cashflow_engine, 54 scenario_analysis, 19 amortization).
 - `compute_pool_assumptions` CDR:
   - Create synthetic cohort: 1000 loans originated Jan 2017. In each of the 12 trailing months (Apr 2018 – Mar 2019), 5 loans default each month with $10K exposure each. Performing balance ~$8M/month. Verify avg_MDR ≈ $50K/$8M ≈ 0.625%/month, CDR = 1-(1-0.00625)^12 ≈ 7.24%
   - Zero defaults in all 12 months: all MDRs = 0, CDR = 0
@@ -310,11 +318,12 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 
 - **ALWAYS use sequential-thinking** MCP before implementing financial math.
 - **ALWAYS read the relevant skill file** before writing code in that domain.
-- **Run tests after any code change.** All 184 tests must pass before considering a change complete.
+- **Run tests after any code change.** All 222 tests must pass before considering a change complete.
 - **Cash flows and scenarios operate on all active loans**: Current with March 2019 last payment date plus all delinquent (In Grace + Late 16-30 + Late 31-120) regardless of last payment date.
 - **CDR is computed from ALL loans in the cohort** using the dv01 conditional methodology: trailing 12-month average MDR, annualized. Cumulative default rate (NOT called CDR) retained for display only.
 - **`compute_pool_assumptions()` requires `reconstruct_loan_timeline()`** on df_all first (for `default_month` and `payoff_month` columns used in conditional CDR).
-- **CPR from Current + Fully Paid loans with March 2019 last payment date.** Fully Paid March 2019 loans represent payoffs that month (prepayment events). Delinquent loans are not prepaying and are excluded.
+- **CPR from Current + Fully Paid loans with March 2019 last payment date.** Fully Paid March 2019 loans represent payoffs that month (prepayment events). Delinquent loans are not prepaying and are excluded. CPR is split into **Full Payoff CPR** (from FP March loans) and **Curtailment CPR** (from Current loans' partial prepayments), both using the same combined denominator.
+- **Curtailments (partial prepayments)**: Age-specific curtailment rates computed from Current loans via `compute_curtailment_rates()`. Applied post-transition in `project_cashflows_transition()` to reduce Current balances. Scaled by CPR ratio in scenario analysis.
 - **Loss severity is FIXED across all three scenarios** — only transition probabilities shift.
 - **All base/stress/upside defaults are cohort-specific**, not global averages.
 - Projection starts at t=0 (March 2019), first payment at t=1 (April 2019).
@@ -322,4 +331,8 @@ All rates/prices displayed as **percentages to 2 decimal places** (e.g., 95.00%,
 - Virtual environment named `.env`.
 - **State-transition model**: Defaults flow through a 5-month pipeline (Current → Delinquent → Late_1 → Late_2 → Late_3 → Charged Off). All-Current pool has zero defaults for months 1-4.
 - **Transition scenario stress**: Late_3→Charged Off is NOT directly stressed — it increases mechanically via re-normalization when cure rates decrease.
-- **The dashboard uses the state-transition model exclusively.** The Simple (flat CDR/CPR) functions remain in the codebase (`project_cashflows`, `solve_price`, `build_scenarios`, `compare_scenarios`) but are not imported or used by `app.py`.
+- **The dashboard uses the state-transition model exclusively.** The Simple (flat CDR/CPR) functions remain in the codebase (`project_cashflows`, `solve_price`, `build_scenarios`, `compare_scenarios`) but are not imported or used by `app.py`. Tab 3 uses `build_scenarios_from_percentiles()` (not `build_scenarios_transition()`) for percentile-driven scenarios.
+- **Base scenario CDR/CPR = pool-level empirical values** (same as Tab 2), NOT the P50 median from vintage distributions.
+- **Stress/Upside CDR/CPR = quarterly vintage percentiles** (P75/P25), NOT arbitrary multiplicative shifts.
+- **`adjust_prepayment_rates()` is deprecated** — no longer used in the dashboard pipeline. Empirical age-specific Current→Fully Paid rates are used directly. Retained for backward compatibility and testing.
+- **CPR scenario scaling uses ratio approach**: `cpr_ratio = scenario_cpr / base_cpr` (pool-level CPR including full payoffs + curtailments), applied as multiplier to age-specific Current→Fully Paid rates and curtailment rates, preserving age-dependent shape.

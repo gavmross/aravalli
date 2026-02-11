@@ -42,12 +42,10 @@ pkill -f "streamlit run"
 
 1. Navigate to `http://localhost:8501`
 2. Verify the page title renders (should contain "Lending Club" or "Loan Portfolio")
-3. Verify the sidebar is visible with all four controls:
+3. Verify the sidebar is visible with:
    - Strata Type dropdown
    - Strata Value dropdown
-   - Purchase Price slider
-   - Stress/Upside % slider
-4. Verify three tabs are visible: Portfolio Metrics, Cash Flow Projection, Scenario Comparison
+4. Verify three tabs are visible: Portfolio Analytics, Cash Flow Projection, Scenario Analysis
 5. Screenshot the initial state
 
 ### Phase 2: Sidebar Filter Interactions
@@ -59,14 +57,7 @@ pkill -f "streamlit run"
 4. Select "ALL" → verify Strata Value dropdown is disabled or hidden
 5. For each selection, verify the main content area updates (no error messages, no blank tables)
 
-**Test purchase price slider**:
-1. Move to 0.50 → verify Tab 2 and Tab 3 update
-2. Move to 1.00 → verify at-par values
-3. Move to 1.20 → verify premium pricing
-
-**Test stress/upside slider**:
-1. Move to 0.05 (5%) → verify scenario table shows tight spread around base
-2. Move to 0.50 (50%) → verify scenario table shows wide spread
+**Note**: Purchase Price inputs are on Tabs 2 and 3, not the sidebar. Test them in their respective tab phases below.
 
 ### Phase 3: Tab 1 — Portfolio Metrics
 
@@ -134,22 +125,36 @@ pkill -f "streamlit run"
 - Verify a price is returned
 - Mentally confirm it's in a reasonable range (0.50–1.50)
 
-### Phase 5: Tab 3 — Scenario Comparison
+### Phase 5: Tab 3 — Scenario Analysis
 
 1. Navigate to Tab 3
-2. Verify the scenario assumption table shows three rows: Base, Stress, Upside
-3. Verify Stress CDR > Base CDR > Upside CDR
-4. Verify Stress CPR < Base CPR < Upside CPR
+2. Verify the **editable scenario assumptions table** renders with:
+   - Three rows: Base, Stress, Upside
+   - CDR (%) and CPR (%) number input fields for each row (6 inputs total)
+   - Pre-populated with computed values (not blank or zero)
+3. Verify **vintage count info** displays below the table (e.g., "Based on N quarterly vintages...")
+4. Verify the **scenario comparison results table** shows:
+   - Three rows: Base, Stress, Upside
+   - CDR and CPR columns showing the values used
+   - IRR, Total Interest, Total Principal, Total Losses, Total Recoveries, Total Defaults, WAL columns
 5. Verify Loss Severity is IDENTICAL across all three rows
-6. Verify the IRR summary table shows three IRR values
-7. Verify Stress IRR < Base IRR < Upside IRR (the expected ordering)
-8. Verify the bar chart renders with three bars
-9. Verify the multi-line balance chart shows three curves
+6. Verify Stress IRR < Base IRR < Upside IRR (the expected ordering)
+7. Verify the multi-line balance chart shows three curves (Base=blue, Stress=red, Upside=green)
 
-**Multiplier validation**:
-- Read Base CDR and Stress CDR from the table
-- With default 15% stress: Stress CDR should equal Base CDR × 1.15
-- Verify to displayed precision
+**Percentile validation**:
+- Verify Stress CDR > Base CDR > Upside CDR (P75 > pool-level > P25)
+- Verify Stress CPR < Base CPR < Upside CPR (P25 < pool-level < P75)
+- Verify Base CDR/CPR matches the values shown on Tab 2 metric cards (same pool-level values)
+
+**User override test**:
+- Manually change the Stress CDR input to a different value
+- Verify the results table and chart update to reflect the new value
+- Verify only the Stress row changes, Base and Upside remain the same
+
+**Edge case — narrow filter**:
+- Select a very specific strata (e.g., a single recent vintage) that produces < 3 qualifying quarterly vintages
+- Verify a warning message appears about insufficient vintages
+- Verify the scenario table still works (falls back to pool-level values for all scenarios)
 
 ### Phase 6: Edge Cases
 
@@ -200,5 +205,7 @@ For any FAIL, include: what was expected, what was observed, and a screenshot if
 - NEVER approve the dashboard without running at least one number spot-check per tab
 - If any tab shows a Python traceback, that is an automatic FAIL for the entire review
 - Loss severity MUST be identical across all three scenarios in Tab 3 — if it's not, flag immediately
+- Base CDR/CPR in Tab 3 MUST match the pool-level values shown in Tab 2 — if they differ, flag immediately
+- The stress/upside CDR/CPR values should come from vintage percentiles, not arbitrary multipliers
 - IRR ordering must be Stress < Base < Upside — if not, flag as a potential formula error
 - Always kill the Streamlit process when done

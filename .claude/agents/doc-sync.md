@@ -57,7 +57,10 @@ For each formula documented in `calculations.md`, locate the corresponding code 
 | IRR definition | calculations.md | `cashflow_engine.py` → `calculate_irr()` | |
 | IRR annualization | calculations.md | `cashflow_engine.py` → `calculate_irr()` | |
 | Cash flow loop | calculations.md | `cashflow_engine.py` → `project_cashflows()` | |
-| Scenario multipliers | calculations.md | `scenario_analysis.py` → `build_scenarios()` | |
+| Scenario percentiles | calculations.md | `scenario_analysis.py` → `compute_vintage_percentiles()` | |
+| Scenario CDR/CPR ratio scaling | calculations.md | `scenario_analysis.py` → `build_scenarios_from_percentiles()` | |
+| Implied CPR | calculations.md | `cashflow_engine.py` → `compute_implied_cpr()` | |
+| Scenario multipliers (legacy) | calculations.md | `scenario_analysis.py` → `build_scenarios()` | |
 | Exposure formula | calculations.md | `portfolio_analytics.py` and `cashflow_engine.py` | |
 | Capped recoveries | calculations.md | `portfolio_analytics.py` and `cashflow_engine.py` | |
 
@@ -102,7 +105,13 @@ For each cleaning step documented in `data_cleaning.md`, verify:
 
 Verify that the Domain Terminology & Formulas section in CLAUDE.md matches `calculations.md`. They should express the same formulas. If CLAUDE.md has been updated but `calculations.md` hasn't (or vice versa), flag the drift.
 
-Also verify the Critical Rules section still reflects actual code behavior (e.g., "Loss severity is FIXED across scenarios" — is this still true in `build_scenarios()`?).
+Also verify the Critical Rules section still reflects actual code behavior (e.g., "Loss severity is FIXED across scenarios" — is this still true in `build_scenarios_from_percentiles()`?).
+
+Additional CLAUDE.md checks:
+- Verify CLAUDE.md describes percentile-based scenarios (not multiplicative shifts) as the dashboard-active approach
+- Verify CLAUDE.md documents `compute_vintage_percentiles`, `build_scenarios_from_percentiles`, and `compute_implied_cpr` in the function reference
+- Verify CLAUDE.md notes that `adjust_prepayment_rates()` is deprecated from the pipeline
+- Verify CLAUDE.md notes that `build_scenarios_transition()` is codebase-only (not dashboard-active)
 
 ### Step 5: Cross-Reference Check
 

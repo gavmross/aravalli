@@ -24,6 +24,144 @@ from src.cashflow_engine import (
 logger = logging.getLogger(__name__)
 
 
+def compute_vintage_percentiles(
+    df_all: pd.DataFrame,
+    df_active: pd.DataFrame,
+    pool_assumptions: dict,
+    min_loans_cdr: int = 1000,
+    min_loans_cpr: int = 1000,
+) -> dict:
+    """
+    Compute per-vintage CDR and CPR, then extract percentiles for scenarios.
+
+    For each quarterly vintage with >= min_loans total loans, computes CDR
+    and CPR via compute_pool_assumptions(). Takes unweighted P25/P50/P75
+    percentiles across qualifying vintages and maps them to scenarios:
+      - Base:   Pool-level empirical CDR and CPR (from pool_assumptions)
+      - Stress: P75 CDR, P25 CPR
+      - Upside: P25 CDR, P75 CPR
+
+    Parameters
+    ----------
+    df_all : pd.DataFrame
+        All loans in the filtered strata (enriched with reconstruct_loan_timeline
+        and calc_amort columns). Used for CDR and loss severity.
+    df_active : pd.DataFrame
+        Active loans (Current March 2019 + delinquent) with calc_amort columns.
+        Used for CPR computation.
+    pool_assumptions : dict
+        Output of compute_pool_assumptions(). Provides pool-level empirical
+        CDR and CPR for the base case.
+    min_loans_cdr : int
+        Minimum number of total loans for a vintage to qualify for CDR (default 1000).
+    min_loans_cpr : int
+        Minimum number of qualifying loans for CPR (default 1000).
+
+    Returns
+    -------
+    dict
+        Keys: 'fallback' (bool), 'vintage_cdrs' (list), 'vintage_cprs' (list),
+        'n_cdr_vintages' (int), 'n_cpr_vintages' (int),
+        'percentiles' (dict | None), 'scenarios' (dict | None),
+        'vintage_data' (pd.DataFrame).
+    """
+    vintage_col = 'issue_quarter'
+    vintages = df_all[vintage_col].dropna().unique()
+
+    vintage_records = []
+    for v in vintages:
+        v_all = df_all[df_all[vintage_col] == v]
+        if len(v_all) < min(min_loans_cdr, min_loans_cpr):
+            continue
+
+        v_active = df_active[df_active[vintage_col] == v]
+
+        try:
+            assumptions = compute_pool_assumptions(v_all, v_active)
+        except Exception:
+            logger.warning("compute_pool_assumptions failed for vintage %s", v)
+            continue
+
+        vintage_records.append({
+            'vintage': v,
+            'cdr': assumptions['cdr'],
+            'cpr': assumptions['cpr'],
+            'loan_count': len(v_all),
+            'active_loan_count': len(v_active),
+        })
+
+    vintage_data = pd.DataFrame(vintage_records)
+
+    # Separate CDR and CPR qualifying vintages
+    # Only vintages with sufficient active (outstanding) loans are relevant
+    # for forward-looking scenario analysis
+    if len(vintage_data) > 0:
+        cdr_qualifying = vintage_data[
+            vintage_data['active_loan_count'] >= min_loans_cdr
+        ]
+        cpr_qualifying = vintage_data[
+            (vintage_data['active_loan_count'] >= min_loans_cpr)
+            & vintage_data['cpr'].notna()
+        ]
+    else:
+        cdr_qualifying = vintage_data
+        cpr_qualifying = vintage_data
+
+    n_cdr_vintages = len(cdr_qualifying)
+    n_cpr_vintages = len(cpr_qualifying)
+    vintage_cdrs = cdr_qualifying['cdr'].tolist() if n_cdr_vintages > 0 else []
+    vintage_cprs = cpr_qualifying['cpr'].tolist() if n_cpr_vintages > 0 else []
+
+    if n_cdr_vintages < 3 or n_cpr_vintages < 3:
+        return {
+            'fallback': True,
+            'vintage_cdrs': vintage_cdrs,
+            'vintage_cprs': vintage_cprs,
+            'n_cdr_vintages': n_cdr_vintages,
+            'n_cpr_vintages': n_cpr_vintages,
+            'percentiles': None,
+            'scenarios': None,
+            'vintage_data': vintage_data,
+        }
+
+    # CDR percentiles
+    cdr_values = np.array(vintage_cdrs)
+    cdr_p25, cdr_p50, cdr_p75 = np.percentile(cdr_values, [25, 50, 75])
+
+    # CPR percentiles
+    cpr_values = np.array(vintage_cprs)
+    cpr_p25, cpr_p50, cpr_p75 = np.percentile(cpr_values, [25, 50, 75])
+
+    pool_cdr = pool_assumptions['cdr']
+    pool_cpr = pool_assumptions['cpr']
+
+    percentiles = {
+        'cdr_p25': float(cdr_p25),
+        'cdr_p50': float(cdr_p50),
+        'cdr_p75': float(cdr_p75),
+        'cpr_p25': float(cpr_p25),
+        'cpr_p50': float(cpr_p50),
+        'cpr_p75': float(cpr_p75),
+    }
+
+    scenarios = {
+        'Base': {'cdr': float(pool_cdr), 'cpr': float(pool_cpr)},
+        'Stress': {'cdr': float(cdr_p75), 'cpr': float(cpr_p25)},
+        'Upside': {'cdr': float(cdr_p25), 'cpr': float(cpr_p75)},
+    }
+
+    return {
+        'fallback': False,
+        'vintage_cdrs': vintage_cdrs,
+        'vintage_cprs': vintage_cprs,
+        'n_cdr_vintages': n_cdr_vintages,
+        'n_cpr_vintages': n_cpr_vintages,
+        'percentiles': percentiles,
+        'scenarios': scenarios,
+        'vintage_data': vintage_data,
+    }
+
+
 def compute_base_assumptions(df_all: pd.DataFrame,
                              df_active: pd.DataFrame) -> dict:
     """
@@ -267,6 +405,128 @@ def build_scenarios_transition(
     }
 
 
+def build_scenarios_from_percentiles(
+    raw_age_probs: pd.DataFrame,
+    pool_cdr: float,
+    base_cpr: float,
+    scenario_cdrs: dict[str, float],
+    scenario_cprs: dict[str, float],
+) -> dict[str, pd.DataFrame]:
+    """
+    Build scenario probability sets from percentile-derived CDR/CPR values.
+
+    For each scenario, scales delinquency/cure transition probabilities
+    by the ratio of scenario CDR to pool CDR, then scales age-specific
+    Current→Fully Paid rates by the ratio of scenario CPR to the
+    pool-level CPR. This preserves the age-dependent shape of the
+    prepayment curve while shifting its overall level.
+
+    CDR scaling logic:
+    - Current rows: to_delinquent_0_30_pct *= cdr_ratio
+    - Non-Current non-absorbing rows: to_current_pct *= 1/cdr_ratio (cure inversely scaled)
+    - Late_3→Charged Off NOT directly scaled (increases via re-normalization)
+    - After multipliers: clamp to [0, 1], adjust residual column for row sum = 1.0
+
+    CPR scaling logic:
+    - Current rows: to_fully_paid_pct *= cpr_ratio at every age bucket
+    - Shift difference into to_current_pct to maintain row sum = 1.0
+    - Clamp to [0, 1] after scaling
+
+    Parameters
+    ----------
+    raw_age_probs : pd.DataFrame
+        Output of compute_age_transition_probabilities(states='7state',
+        bucket_size=1). Empirical rates used directly (not CPR-adjusted).
+    pool_cdr : float
+        Pool-level CDR (denominator for the CDR scaling ratio).
+    base_cpr : float
+        Pool-level CPR including both full payoffs and curtailments
+        (denominator for the CPR scaling ratio).
+    scenario_cdrs : dict[str, float]
+        Mapping scenario name → CDR value (e.g., {'Base': 0.07, ...}).
+    scenario_cprs : dict[str, float]
+        Mapping scenario name → CPR value (e.g., {'Base': 0.015, ...}).
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Mapping scenario name → adjusted probability DataFrame, directly
+        usable by compare_scenarios_transition().
+    """
+    pct_cols = [c for c in raw_age_probs.columns if c.endswith('_pct')]
+
+    result = {}
+    for name in scenario_cdrs:
+        scenario_cdr = scenario_cdrs[name]
+        scenario_cpr = scenario_cprs[name]
+
+        # CDR ratio: how much to scale delinquency relative to pool level
+        if pool_cdr > 0:
+            cdr_ratio = scenario_cdr / pool_cdr
+        else:
+            cdr_ratio = 1.0
+
+        # CPR ratio: how much to scale prepayment relative to pool-level CPR
+        if base_cpr > 0:
+            cpr_ratio = scenario_cpr / base_cpr
+        else:
+            cpr_ratio = 1.0
+
+        adjusted = raw_age_probs.copy()
+
+        for idx, row in adjusted.iterrows():
+            from_status = row['from_status']
+
+            if from_status in ('Charged Off', 'Fully Paid'):
+                continue  # Absorbing states don't change
+
+            if from_status == 'Current':
+                # Scale delinquency rate by CDR ratio
+                if 'to_delinquent_0_30_pct' in adjusted.columns:
+                    adjusted.at[idx, 'to_delinquent_0_30_pct'] = np.clip(
+                        row['to_delinquent_0_30_pct'] * cdr_ratio, 0, 1,
+                    )
+
+                # Scale prepayment rate by CPR ratio (preserves age-dependent shape)
+                if 'to_fully_paid_pct' in adjusted.columns:
+                    old_fp = row['to_fully_paid_pct']
+                    new_fp = np.clip(old_fp * cpr_ratio, 0, 1)
+                    adjusted.at[idx, 'to_fully_paid_pct'] = new_fp
+            else:
+                # Non-current: inversely scale cure rate
+                if 'to_current_pct' in adjusted.columns:
+                    inverse_ratio = (1.0 / cdr_ratio) if cdr_ratio > 0 else 1.0
+                    adjusted.at[idx, 'to_current_pct'] = np.clip(
+                        row['to_current_pct'] * inverse_ratio, 0, 1,
+                    )
+
+            # Re-normalize: adjust residual column to make row sum = 1.0
+            if from_status == 'Current':
+                residual_col = 'to_current_pct'
+            elif from_status == 'Delinquent (0-30)':
+                residual_col = 'to_late_1_pct'
+            elif from_status == 'Late_1':
+                residual_col = 'to_late_2_pct'
+            elif from_status == 'Late_2':
+                residual_col = 'to_late_3_pct'
+            elif from_status == 'Late_3':
+                residual_col = 'to_charged_off_pct'
+            else:
+                residual_col = None
+
+            if residual_col and residual_col in adjusted.columns:
+                other_sum = sum(
+                    adjusted.at[idx, c] for c in pct_cols if c != residual_col
+                )
+                adjusted.at[idx, residual_col] = np.clip(
+                    1.0 - other_sum, 0, 1
+                )
+
+        result[name] = adjusted
+
+    return result
+
+
 def compare_scenarios_transition(
     pool_state: dict,
     scenario_probs: dict,
@@ -275,6 +535,7 @@ def compare_scenarios_transition(
     pool_chars: dict,
     num_months: int,
     purchase_price: float,
+    scenario_curtailment_rates: dict[str, dict[int, float]] | None = None,
 ) -> pd.DataFrame:
     """
     Run transition projections and IRR for each scenario.
@@ -295,6 +556,9 @@ def compare_scenarios_transition(
         Number of months to project.
     purchase_price : float
         Purchase price as fraction of UPB.
+    scenario_curtailment_rates : dict[str, dict[int, float]] | None
+        Per-scenario curtailment rates. Maps scenario name → {age: smm}.
+        If None, no curtailments applied (backward compatible).
 
     Returns
     -------
@@ -305,9 +569,10 @@ def compare_scenarios_transition(
     results = []
 
     for name, probs_df in scenario_probs.items():
+        curtailment = scenario_curtailment_rates.get(name) if scenario_curtailment_rates else None
         cf_df = project_cashflows_transition(
             pool_state, probs_df, loss_severity, recovery_rate,
-            pool_chars, num_months,
+            pool_chars, num_months, curtailment_rates=curtailment,
         )
         irr = calculate_irr(cf_df, pool_chars, purchase_price)
 

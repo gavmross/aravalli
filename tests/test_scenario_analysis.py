@@ -5,13 +5,16 @@ import pandas as pd
 import pytest
 
 from src.scenario_analysis import (
+    compute_vintage_percentiles,
     compute_base_assumptions,
     build_scenarios,
     compare_scenarios,
     build_scenarios_transition,
+    build_scenarios_from_percentiles,
     compare_scenarios_transition,
 )
 from src.cashflow_engine import (
+    compute_pool_assumptions,
     project_cashflows_transition,
     calculate_irr,
 )
@@ -565,3 +568,411 @@ class TestCompareScenariosTransition:
         base_losses = result[result['scenario'] == 'Base']['total_losses'].values[0]
         stress_losses = result[result['scenario'] == 'Stress']['total_losses'].values[0]
         assert stress_losses > base_losses
+
+
+# ---------------------------------------------------------------------------
+# build_scenarios_from_percentiles
+# ---------------------------------------------------------------------------
+
+class TestBuildScenariosFromPercentiles:
+
+    def test_returns_three_scenarios(self, transition_base_probs):
+        """Should return Base, Stress, Upside keys."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        assert set(result.keys()) == {'Base', 'Stress', 'Upside'}
+
+    def test_rows_sum_to_one(self, transition_base_probs):
+        """All rows in each scenario should sum to 1.0."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        pct_cols = [c for c in transition_base_probs.columns if c.endswith('_pct')]
+
+        for name, probs_df in result.items():
+            for _, row in probs_df.iterrows():
+                total = sum(row[c] for c in pct_cols)
+                assert abs(total - 1.0) < 0.02, (
+                    f"{name}: {row['from_status']} at age {row['age_bucket']} "
+                    f"sums to {total}"
+                )
+
+    def test_stress_higher_delinquency(self, transition_base_probs):
+        """Stress (higher CDR ratio) → higher Current→Delinquent rate."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        base_curr = result['Base'][result['Base']['from_status'] == 'Current']
+        stress_curr = result['Stress'][result['Stress']['from_status'] == 'Current']
+
+        for i in range(len(base_curr)):
+            assert (stress_curr.iloc[i]['to_delinquent_0_30_pct']
+                    > base_curr.iloc[i]['to_delinquent_0_30_pct'])
+
+    def test_stress_lower_cure_rates(self, transition_base_probs):
+        """Stress → lower cure rates for non-Current states."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        for state in ['Delinquent (0-30)', 'Late_1', 'Late_2']:
+            base_rows = result['Base'][result['Base']['from_status'] == state]
+            stress_rows = result['Stress'][result['Stress']['from_status'] == state]
+
+            for i in range(len(base_rows)):
+                if base_rows.iloc[i]['to_current_pct'] > 0:
+                    assert (stress_rows.iloc[i]['to_current_pct']
+                            < base_rows.iloc[i]['to_current_pct'])
+
+    def test_late3_default_not_directly_scaled(self, transition_base_probs):
+        """Late_3→Charged Off increases via re-normalization, not direct scaling."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        l3_stress = result['Stress'][result['Stress']['from_status'] == 'Late_3']
+        l3_base = result['Base'][result['Base']['from_status'] == 'Late_3']
+
+        for i in range(len(l3_base)):
+            # Should increase (via less cure → more default in residual)
+            assert (l3_stress.iloc[i]['to_charged_off_pct']
+                    >= l3_base.iloc[i]['to_charged_off_pct'] - 0.001)
+
+    def test_different_cpr_per_scenario(self, transition_base_probs):
+        """Each scenario should have different Current→Fully Paid rates."""
+        cdrs = {'Base': 0.08, 'Stress': 0.08, 'Upside': 0.08}  # same CDR
+        cprs = {'Base': 0.015, 'Stress': 0.005, 'Upside': 0.030}  # different CPR
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        # Get first Current row for each scenario
+        base_fp = result['Base'][
+            result['Base']['from_status'] == 'Current'
+        ].iloc[0]['to_fully_paid_pct']
+        stress_fp = result['Stress'][
+            result['Stress']['from_status'] == 'Current'
+        ].iloc[0]['to_fully_paid_pct']
+        upside_fp = result['Upside'][
+            result['Upside']['from_status'] == 'Current'
+        ].iloc[0]['to_fully_paid_pct']
+
+        # Upside (highest CPR) → highest prepayment rate
+        assert upside_fp > base_fp
+        assert base_fp > stress_fp
+
+    def test_pool_cdr_zero_no_crash(self, transition_base_probs):
+        """pool_cdr=0 → CDR scaling skipped (ratio=1.0), CPR still works."""
+        cdrs = {'Base': 0.0, 'Stress': 0.05, 'Upside': 0.0}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        result = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.0,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        # Should not crash, and return valid probability DataFrames
+        assert set(result.keys()) == {'Base', 'Stress', 'Upside'}
+        pct_cols = [c for c in transition_base_probs.columns if c.endswith('_pct')]
+        for name, probs_df in result.items():
+            for _, row in probs_df.iterrows():
+                total = sum(row[c] for c in pct_cols)
+                assert abs(total - 1.0) < 0.02
+
+    def test_integration_irr_ordering(self, transition_base_probs,
+                                       transition_pool_state,
+                                       transition_pool_chars):
+        """Stress IRR < Base IRR < Upside IRR (integration test)."""
+        cdrs = {'Base': 0.08, 'Stress': 0.12, 'Upside': 0.05}
+        cprs = {'Base': 0.015, 'Stress': 0.010, 'Upside': 0.020}
+        scenario_probs = build_scenarios_from_percentiles(
+            transition_base_probs, pool_cdr=0.08,
+            base_cpr=1 - (1 - 0.04) ** 12,
+            scenario_cdrs=cdrs, scenario_cprs=cprs,
+        )
+        comparison = compare_scenarios_transition(
+            transition_pool_state, scenario_probs,
+            0.85, 0.15, transition_pool_chars, 30, 0.95,
+        )
+        base_irr = comparison[comparison['scenario'] == 'Base']['irr'].values[0]
+        stress_irr = comparison[comparison['scenario'] == 'Stress']['irr'].values[0]
+        upside_irr = comparison[comparison['scenario'] == 'Upside']['irr'].values[0]
+
+        assert stress_irr < base_irr, f"Stress {stress_irr} >= Base {base_irr}"
+        assert upside_irr > base_irr, f"Upside {upside_irr} <= Base {base_irr}"
+
+
+# ---------------------------------------------------------------------------
+# compute_vintage_percentiles
+# ---------------------------------------------------------------------------
+
+def _make_vintage_cohort(
+    vintage: str,
+    n_total: int,
+    n_defaults: int,
+    issue_d: str,
+    out_prncp_current: float = 3100.0,
+    recovery_per_default: float = 500.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Helper: build a synthetic (df_all, df_active) pair for one vintage.
+
+    Defaults spread across trailing 12 months (Apr 2018 – Mar 2019).
+    Remaining loans are Current with March 2019 last payment date.
+    """
+    n_current = n_total - n_defaults
+
+    funded = [10000.0] * n_total
+    rec_prncp = [0.0] * n_defaults + [5000.0] * n_current
+    int_rate = [0.10] * n_total
+    term_months = [36] * n_total
+    recoveries = [recovery_per_default] * n_defaults + [0.0] * n_current
+    out_prncp = [0.0] * n_defaults + [out_prncp_current] * n_current
+
+    loan_status = ['Charged Off'] * n_defaults + ['Current'] * n_current
+
+    snapshot = pd.Timestamp('2019-03-01')
+    default_months = []
+    for i in range(n_defaults):
+        m = (i % 12) + 1
+        month_start = snapshot - pd.DateOffset(months=m)
+        default_months.append(month_start.strftime('%Y-%m-%d'))
+    default_months.extend([None] * n_current)
+
+    payoff_months = [None] * n_total
+    last_pymnt_d = ['2018-01-01'] * n_defaults + ['2019-03-01'] * n_current
+
+    last_pmt_beginning_balance = [0.0] * n_defaults + [5200.0] * n_current
+    last_pmt_scheduled_principal = [0.0] * n_defaults + [200.0] * n_current
+    last_pmt_unscheduled_principal = [0.0] * n_defaults + [50.0] * n_current
+
+    df_all = pd.DataFrame({
+        'funded_amnt': funded,
+        'total_rec_prncp': rec_prncp,
+        'loan_status': loan_status,
+        'recoveries': recoveries,
+        'issue_d': [issue_d] * n_total,
+        'int_rate': int_rate,
+        'term_months': term_months,
+        'out_prncp': out_prncp,
+        'default_month': default_months,
+        'payoff_month': payoff_months,
+        'last_pymnt_d': last_pymnt_d,
+        'issue_quarter': [vintage] * n_total,
+        'last_pmt_beginning_balance': last_pmt_beginning_balance,
+        'last_pmt_scheduled_principal': last_pmt_scheduled_principal,
+        'last_pmt_unscheduled_principal': last_pmt_unscheduled_principal,
+    })
+
+    df_active = df_all[df_all['loan_status'] == 'Current'].copy()
+    return df_all, df_active
+
+
+def _build_multi_vintage_data(n_loans=200):
+    """Build 4 vintages with different CDR levels."""
+    configs = [
+        ('2017-Q1', n_loans, int(n_loans * 0.05), '2017-01-01'),
+        ('2017-Q2', n_loans, int(n_loans * 0.10), '2017-04-01'),
+        ('2017-Q3', n_loans, int(n_loans * 0.15), '2017-07-01'),
+        ('2017-Q4', n_loans, int(n_loans * 0.20), '2017-10-01'),
+    ]
+    all_dfs, active_dfs = [], []
+    for vintage, n_total, n_defaults, issue_d in configs:
+        df_a, df_act = _make_vintage_cohort(vintage, n_total, n_defaults, issue_d)
+        all_dfs.append(df_a)
+        active_dfs.append(df_act)
+
+    df_all = pd.concat(all_dfs, ignore_index=True)
+    df_active = pd.concat(active_dfs, ignore_index=True)
+    return df_all, df_active
+
+
+@pytest.fixture
+def multi_vintage_data():
+    """4 vintages, 200 loans each, varying default counts."""
+    return _build_multi_vintage_data(n_loans=200)
+
+
+@pytest.fixture
+def multi_vintage_pool_assumptions(multi_vintage_data):
+    """Pool-level assumptions for the multi-vintage data."""
+    df_all, df_active = multi_vintage_data
+    return compute_pool_assumptions(df_all, df_active)
+
+
+class TestComputeVintagePercentiles:
+
+    def test_returns_expected_keys(self, multi_vintage_data, multi_vintage_pool_assumptions):
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        expected_keys = {'fallback', 'vintage_cdrs', 'vintage_cprs',
+                         'n_cdr_vintages', 'n_cpr_vintages',
+                         'percentiles', 'scenarios', 'vintage_data'}
+        assert set(result.keys()) == expected_keys
+
+    def test_correct_qualifying_vintage_count(self, multi_vintage_data,
+                                               multi_vintage_pool_assumptions):
+        """4 vintages, each with 200 loans (>= 100 min_loans) → 4 qualifying."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        assert result['n_cdr_vintages'] == 4
+        assert not result['fallback']
+
+    def test_percentile_ordering(self, multi_vintage_data, multi_vintage_pool_assumptions):
+        """cdr_p25 <= cdr_p50 <= cdr_p75, same for CPR."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        p = result['percentiles']
+        assert p['cdr_p25'] <= p['cdr_p50'] <= p['cdr_p75']
+        assert p['cpr_p25'] <= p['cpr_p50'] <= p['cpr_p75']
+
+    def test_fallback_when_few_vintages(self, multi_vintage_data,
+                                         multi_vintage_pool_assumptions):
+        """min_loans=300 excludes all vintages (each has 200) → fallback."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=300, min_loans_cpr=300)
+        assert result['fallback'] is True
+        assert result['percentiles'] is None
+        assert result['scenarios'] is None
+
+    def test_min_loans_filter(self, multi_vintage_data, multi_vintage_pool_assumptions):
+        """With min_loans=201, no vintage qualifies (each has exactly 200)."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=201, min_loans_cpr=201)
+        assert result['fallback'] is True
+        assert result['n_cdr_vintages'] == 0
+
+    def test_zero_default_vintage_valid(self):
+        """A vintage with zero defaults has CDR=0 and still qualifies."""
+        configs = [
+            ('2017-Q1', 200, 0, '2017-01-01'),
+            ('2017-Q2', 200, 20, '2017-04-01'),
+            ('2017-Q3', 200, 30, '2017-07-01'),
+            ('2017-Q4', 200, 40, '2017-10-01'),
+        ]
+        all_dfs, active_dfs = [], []
+        for vintage, n_total, n_defaults, issue_d in configs:
+            df_a, df_act = _make_vintage_cohort(vintage, n_total, n_defaults, issue_d)
+            all_dfs.append(df_a)
+            active_dfs.append(df_act)
+
+        df_all = pd.concat(all_dfs, ignore_index=True)
+        df_active = pd.concat(active_dfs, ignore_index=True)
+        pool_assumptions = compute_pool_assumptions(df_all, df_active)
+
+        result = compute_vintage_percentiles(
+            df_all, df_active, pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        assert result['n_cdr_vintages'] == 4
+        assert not result['fallback']
+        assert result['percentiles']['cdr_p25'] >= 0.0
+
+    def test_base_uses_pool_level(self, multi_vintage_data, multi_vintage_pool_assumptions):
+        """Base scenario uses pool-level CDR/CPR, not P50 median."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        s = result['scenarios']
+        assert abs(s['Base']['cdr'] - multi_vintage_pool_assumptions['cdr']) < 1e-10
+        assert abs(s['Base']['cpr'] - multi_vintage_pool_assumptions['cpr']) < 1e-10
+
+    def test_stress_upside_use_percentiles(self, multi_vintage_data,
+                                            multi_vintage_pool_assumptions):
+        """Stress=P75 CDR/P25 CPR, Upside=P25 CDR/P75 CPR."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        p = result['percentiles']
+        s = result['scenarios']
+
+        assert abs(s['Stress']['cdr'] - p['cdr_p75']) < 1e-10
+        assert abs(s['Stress']['cpr'] - p['cpr_p25']) < 1e-10
+        assert abs(s['Upside']['cdr'] - p['cdr_p25']) < 1e-10
+        assert abs(s['Upside']['cpr'] - p['cpr_p75']) < 1e-10
+
+    def test_vintage_data_dataframe(self, multi_vintage_data,
+                                     multi_vintage_pool_assumptions):
+        """vintage_data should be a DataFrame with expected columns."""
+        df_all, df_active = multi_vintage_data
+        result = compute_vintage_percentiles(
+            df_all, df_active, multi_vintage_pool_assumptions,
+            min_loans_cdr=100, min_loans_cpr=100)
+        vd = result['vintage_data']
+        assert isinstance(vd, pd.DataFrame)
+        assert set(vd.columns) >= {'vintage', 'cdr', 'cpr', 'loan_count'}
+        assert len(vd) == 4
+
+
+# ---------------------------------------------------------------------------
+# compare_scenarios_transition with curtailment rates
+# ---------------------------------------------------------------------------
+
+class TestCompareScenariosTransitionCurtailments:
+
+    def test_none_curtailments_backward_compat(self, transition_pool_state,
+                                                transition_base_probs,
+                                                transition_pool_chars):
+        """scenario_curtailment_rates=None → backward compatible (no crash)."""
+        scenario_probs = build_scenarios_transition(transition_base_probs)
+        result = compare_scenarios_transition(
+            transition_pool_state, scenario_probs,
+            0.85, 0.15, transition_pool_chars, 30, 0.95,
+            scenario_curtailment_rates=None,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 3
+
+    def test_curtailments_increase_total_principal(self, transition_pool_state,
+                                                    transition_base_probs,
+                                                    transition_pool_chars):
+        """With curtailment rates, total_principal should increase."""
+        scenario_probs = build_scenarios_transition(transition_base_probs)
+
+        result_no_curt = compare_scenarios_transition(
+            transition_pool_state, scenario_probs,
+            0.85, 0.15, transition_pool_chars, 30, 0.95,
+            scenario_curtailment_rates=None,
+        )
+
+        curt_rates = {a: 0.01 for a in range(60)}
+        scenario_curt = {name: curt_rates for name in scenario_probs}
+        result_with_curt = compare_scenarios_transition(
+            transition_pool_state, scenario_probs,
+            0.85, 0.15, transition_pool_chars, 30, 0.95,
+            scenario_curtailment_rates=scenario_curt,
+        )
+
+        base_no = result_no_curt[result_no_curt['scenario'] == 'Base']['total_principal'].values[0]
+        base_with = result_with_curt[result_with_curt['scenario'] == 'Base']['total_principal'].values[0]
+        assert base_with > base_no

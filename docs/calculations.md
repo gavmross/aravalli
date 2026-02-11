@@ -192,6 +192,37 @@ Only loans with `last_pmt_beginning_balance > 0` are included (avoids division b
 
 **Rationale**: CPR is computed from the most recent payment period of performing loans — Current loans plus Fully Paid loans with a March 2019 last payment date (those that paid off during the observation month). The pool-level SMM aggregates across these loans rather than averaging individual SMMs, which would not properly weight by balance.
 
+### CPR Split: Full Payoff vs Curtailment
+
+The total CPR is decomposed into two additive components using the **same combined denominator** (all CPR-eligible loans: Current + Fully Paid March 2019):
+
+```
+denominator = total_beginning_balance - total_scheduled_principal  (from all CPR-eligible loans)
+
+Full Payoff SMM = (unscheduled_principal from FP March loans) / denominator
+Full Payoff CPR = 1 - (1 - Full Payoff SMM)^12
+
+Curtailment SMM = (unscheduled_principal from Current loans) / denominator
+Curtailment CPR = 1 - (1 - Curtailment SMM)^12
+```
+
+- **Full payoffs**: Fully Paid March 2019 loans — their `last_pmt_unscheduled_principal` represents the full payoff excess above scheduled principal
+- **Curtailments**: Current loans — their `last_pmt_unscheduled_principal` represents extra principal payments above the installment (partial prepayments)
+
+Since both SMMs use the same denominator, `Full Payoff SMM + Curtailment SMM ≈ total SMM`. The annualized CPRs are approximately additive (small convexity term from the `1-(1-SMM)^12` formula).
+
+### Age-Specific Curtailment Rates
+
+Implemented in `src/cashflow_engine.py: compute_curtailment_rates()`.
+
+For each loan age (months) among Current loans:
+
+```
+curtailment_smm[age] = sum(last_pmt_unscheduled_principal) / sum(last_pmt_beginning_balance - last_pmt_scheduled_principal)
+```
+
+Returns `dict[int, float]` mapping loan age → curtailment SMM (clamped to [0, 1]). These age-specific rates are used by `project_cashflows_transition()` to apply curtailments each month, reducing Current balances by the observed partial prepayment rate at each age.
+
 ### Loss Severity
 
 Computed from **Charged Off loans** in the filtered strata with positive exposure:
@@ -542,35 +573,54 @@ For each month t = 1 to num_months:
      + any other state→Charged Off transitions
    - losses = new_defaults × loss_severity
    - recoveries = new_defaults × recovery_rate
-   - total_cashflow = interest + sched_principal + prepayments + recoveries
 
-3. UPDATE STATE:
+3. CURTAILMENTS (if curtailment_rates provided):
+   - For each Current[age] bucket:
+     curtailment_rate = curtailment_rates[age]  (nearest lower age fallback)
+     curtailment = Current[age] × curtailment_rate
+     Current[age] -= curtailment
+   - curtailments = Σ all curtailments
+   - total_principal = sched_principal + prepayments + curtailments
+   - total_cashflow = interest + total_principal + recoveries
+
+4. UPDATE STATE:
    - New Current[age+1] = stays + all cured
    - Subtract sched_principal proportionally from Current buckets
    - Roll other states forward (Delinq→Late_1, Late_1→Late_2, etc.)
    - Accumulate defaults and payoffs
 ```
 
-### Prepayment Rate Override
+### Age-Specific Prepayment Rates
 
-The empirical `Current → Fully Paid` transition probabilities from the historical data include **all** payoffs — both voluntary prepayments and loans reaching maturity. This overstates the forward-looking prepayment rate for currently performing loans (many of which are mid-term).
+The dashboard uses empirical age-specific `Current → Fully Paid` transition probabilities directly from `compute_age_transition_probabilities()`. These rates capture age-dependent prepayment behavior — young loans have low prepayment rates, while loans near maturity have high rates. This is correct because:
 
-Before projection, the engine calls `adjust_prepayment_rates(age_probs, cpr)` which:
+1. **Even maturity payoffs are prepayment from a cash flow perspective.** If a loan has $300 outstanding and the scheduled installment is $100, the extra $200 paid above schedule is unscheduled principal. The investor gets cash back earlier than the amortization schedule implies.
+2. **The transition model handles age natively.** Each loan has a specific age, and the projection walks it forward month by month through age-specific transition probabilities.
+3. **A flat CPR override misstates cash flow timing.** Telling the model that a 6-month-old loan prepays at the same rate as a 34-month-old loan overstates early prepayment and understates late prepayment, distorting IRR accuracy.
 
-1. Converts the pool-level CPR to a monthly SMM: `SMM = 1 - (1 - CPR)^(1/12)`
-2. Replaces all `Current → Fully Paid` probabilities with this constant SMM
-3. Adds the difference back to `Current → Current` to maintain row sum = 1.0
+The `adjust_prepayment_rates()` function (which replaced all age-specific rates with a flat CPR-derived SMM) is **deprecated** and no longer called by the dashboard. It is retained for backward compatibility.
 
-This means the **state-transition model drives defaults only** (through the delinquency pipeline), while **prepayments use the same constant CPR** as the Simple model. The CPR is derived from the pool's historical single-month prepayment behavior (from `compute_pool_assumptions()`), and the user can override it on Tab 2.
+### Implied CPR
 
-**Example**: CPR = 1.49% → SMM = 1 - (1 - 0.0149)^(1/12) = 0.00125 (0.125%/month). This replaces the empirical ~2.8%/month rate.
+Implemented in `src/cashflow_engine.py: compute_implied_cpr()`.
+
+The pool-level implied CPR summarizes what the empirical age-specific rates imply for the current pool composition:
+
+```
+1. For each age in the Current state, get UPB and Current→Fully Paid rate (SMM)
+2. weighted_avg_smm = Σ(smm[age] × upb[age]) / Σ(upb[age])
+3. implied_cpr = 1 - (1 - weighted_avg_smm)^12
+```
+
+This implied CPR is retained for reference and testing. The pool-level CPR from `compute_pool_assumptions()` (which includes both full payoffs and curtailments) is now used as the denominator for scenario CPR ratio scaling (see Vintage Percentile Scenario Methodology below).
 
 ### Key Design Decisions
 
 - **Interest from Current UPB only**: Only performing (Current) loans accrue interest.
-- **Prepayments use CPR-derived SMM, not empirical transition rates**: Forward-looking prepayment behavior is driven by the constant pool-level CPR, not the historical `Current → Fully Paid` rate (which includes maturity payoffs).
+- **Prepayments use empirical age-specific transition rates**: Forward-looking prepayment behavior is driven by age-dependent rates that capture the full prepayment curve including near-maturity payoffs.
 - **Defaults from Late_3→Charged Off**: Primary default path (other state→Charged Off transitions also captured).
-- **Losses NOT subtracted from investor cashflow**: `total_cashflow = interest + sched_principal + prepayments + recoveries`. Losses are tracked but not deducted (investor receives recovery portion).
+- **Losses NOT subtracted from investor cashflow**: `total_cashflow = interest + sched_principal + prepayments + curtailments + recoveries`. Losses are tracked but not deducted (investor receives recovery portion).
+- **Curtailments applied post-transition**: After state transitions and scheduled principal scaling, curtailments reduce Current balances by age-specific partial prepayment rates. Backward compatible: `curtailment_rates=None` → no curtailments.
 - **Same pool-level WAC/WAM/monthly_payment as Simple model**: Only the default/prepayment mechanism differs.
 
 ### Price Solver (Transition)
@@ -604,6 +654,83 @@ Instead of shifting CDR/CPR, scenarios shift the transition probabilities themse
 **Loss severity**: FIXED across all scenarios (same as Simple model).
 
 **Expected ordering**: Stress IRR < Base IRR < Upside IRR.
+
+### Vintage Percentile Scenario Methodology
+
+Implemented in `src/scenario_analysis.py: compute_vintage_percentiles()` and `src/scenario_analysis.py: build_scenarios_from_percentiles()`.
+
+Instead of applying an arbitrary ±X% multiplicative slider, scenarios are grounded in empirical vintage-level variation:
+
+#### Step 1: Per-Vintage CDR and CPR
+
+For each quarterly vintage in the filtered strata:
+1. Subset `df_all` and `df_active` to that vintage
+2. Call `compute_pool_assumptions()` to get the vintage-specific CDR and CPR
+3. CDR qualifies if the vintage has >= `min_loans_cdr` (default 1000) total loans
+4. CPR qualifies if the vintage has >= `min_loans_cpr` (default 1000) total loans AND a non-NaN CPR
+5. Store `{vintage, cdr, cpr, loan_count}`
+
+CDR and CPR qualifying vintage counts may differ (e.g., a vintage with many loans but no March 2019 Current/Fully Paid loans will qualify for CDR but not CPR).
+
+#### Step 2: Percentile Extraction
+
+Take unweighted P25/P75 percentiles across qualifying vintages:
+
+| Percentile | CDR | CPR |
+|------------|-----|-----|
+| P25 | Low default rate | Low prepayment rate |
+| P75 | High default rate | High prepayment rate |
+
+#### Step 3: Scenario Mapping
+
+| Scenario | CDR Source | CPR Source | Rationale |
+|----------|-----------|-----------|-----------|
+| Base | Pool-level empirical CDR | Pool-level empirical CPR | Observed pool behavior from `compute_pool_assumptions()` |
+| Stress | P75 CDR | P25 CPR | Higher defaults + slower prepayments |
+| Upside | P25 CDR | P75 CPR | Lower defaults + faster prepayments |
+
+**Why Base = pool-level, not P50**: The pool-level CDR/CPR from `compute_pool_assumptions()` is the best estimate of the cohort's actual behavior because it uses all loans with proper weighting. The P50 vintage median can diverge from the pool-level rate due to vintage size differences and is reserved for characterizing the cross-vintage distribution.
+
+#### Step 4: CDR Ratio Scaling
+
+The scenario CDR is used to scale transition probabilities via a ratio:
+
+```
+cdr_ratio = scenario_cdr / pool_cdr
+```
+
+Where `pool_cdr` is the pool-level CDR from `compute_pool_assumptions()`.
+
+- **Current rows**: `to_delinquent_0_30_pct *= cdr_ratio` — scales delinquency entry rate
+- **Non-Current non-absorbing rows**: `to_current_pct *= 1/cdr_ratio` — inversely scales cure rates
+- **Late_3→Charged Off**: NOT directly scaled — increases mechanically via re-normalization
+- After multipliers: clamp to [0, 1], adjust residual column for row sum = 1.0
+
+#### Step 5: CPR Ratio Scaling
+
+Each scenario's CPR scales the age-specific Current→Fully Paid rates via a ratio:
+
+```
+cpr_ratio = scenario_cpr / base_cpr
+```
+
+Where `base_cpr` is the pool-level CPR from `compute_pool_assumptions()` (includes both full payoffs and curtailments). For each age bucket's Current row, `to_fully_paid_pct` is multiplied by `cpr_ratio`, and the difference is shifted into `to_current_pct`. This preserves the age-dependent prepayment shape while scaling the overall level.
+
+Additionally, age-specific curtailment rates are scaled by the same `cpr_ratio` for each scenario:
+
+```
+scenario_curtailment[age] = min(base_curtailment[age] × cpr_ratio, 1.0)
+```
+
+This ensures curtailments scale proportionally with the scenario's total prepayment speed.
+
+#### Fallback Behavior
+
+If fewer than 3 qualifying CDR vintages exist (e.g., narrow filter), the function returns `fallback=True` and the dashboard pre-populates with pool-level CDR/CPR ± 15% as defaults.
+
+#### Editable Inputs
+
+The dashboard displays 6 editable `number_input` fields (3 scenarios × CDR + CPR), pre-populated from percentile-derived values. Users can override any value before running projections.
 
 ---
 

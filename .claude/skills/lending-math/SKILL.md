@@ -316,7 +316,10 @@ Scenarios are built by applying multipliers to the **base case CDR and CPR**. Lo
 Base case CDR and CPR come from `compute_pool_assumptions()`, which uses **historical data for the filtered cohort**:
 
 - **CDR**: From ALL loans in the strata (need Charged Off loans to calculate default rate)
-- **CPR**: From Current + Fully Paid loans with March 2019 last payment date. Delinquent loans are excluded — they are behind on payments, not prepaying.
+- **CPR**: From Current + Fully Paid loans with March 2019 last payment date. Delinquent loans are excluded — they are behind on payments, not prepaying. Split into two components using the same combined denominator:
+  - **Full Payoff CPR**: From Fully Paid March 2019 loans (full loan payoffs)
+  - **Curtailment CPR**: From Current loans' partial prepayments above scheduled installment
+  - Age-specific curtailment rates (per loan age) also computed for use in state-transition projections
 - **Loss Severity**: From Charged Off loans in the strata (with capped recoveries)
 
 These are cohort-specific, not global averages. If the user filters to "Grade B, 36-month, 2016Q4", the base case reflects that specific cohort's historical performance.

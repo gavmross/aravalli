@@ -45,11 +45,11 @@ def calculate_credit_metrics(df: pd.DataFrame,
     - curr_upb_grace_mm: UPB of "In Grace Period" loans (in millions)
     - curr_upb_late_16_30_mm: UPB of "Late (16-30 days)" loans (in millions)
     - curr_upb_late_31_120_mm: UPB of "Late (31-120 days)" loans (in millions)
-    - curr_wac: Weighted average coupon (Current loans only)
-    - curr_wam: Weighted average remaining maturity (Current loans only)
-    - curr_wala: Weighted average loan age (Current loans only)
-    - curr_avg_fico: Weighted average FICO (Current loans only)
-    - curr_avg_dti: Weighted average DTI (Current loans only)
+    - curr_wac: Weighted average coupon (all active loans)
+    - curr_wam: Weighted average remaining maturity (all active loans)
+    - curr_wala: Weighted average loan age (all active loans)
+    - curr_avg_fico: Weighted average FICO (all active loans)
+    - curr_avg_dti: Weighted average DTI (all active loans)
 
     TERMINAL STATUS:
     - upb_fully_paid_mm: Sum of total_rec_prncp for "Fully Paid" loans (in millions)
@@ -204,26 +204,24 @@ def _calculate_metrics_for_group(df: pd.DataFrame,
         metrics['active_upb_late_16_30_perc'] = 0
         metrics['active_upb_late_31_120_perc'] = 0
 
-    # Current metrics (weighted by out_prncp for Current loans only)
-    current_only = active_loans[active_loans['loan_status'] == 'Current']
-    current_upb = current_only['out_prncp'].sum()
-    if len(current_only) > 0 and current_upb > 0:
-        curr_weight = current_only['out_prncp'].values
+    # Active metrics (weighted by out_prncp for all active loans)
+    if len(active_loans) > 0 and active_total_upb > 0:
+        active_weight = active_loans['out_prncp'].values
 
-        # WAC (current)
-        metrics['curr_wac'] = np.average(current_only['int_rate'].values, weights=curr_weight)
+        # WAC (active)
+        metrics['curr_wac'] = np.average(active_loans['int_rate'].values, weights=active_weight)
 
-        # WAM (current - remaining term)
-        metrics['curr_wam'] = np.average(current_only['updated_remaining_term'].values, weights=curr_weight)
+        # WAM (active - remaining term)
+        metrics['curr_wam'] = np.average(active_loans['updated_remaining_term'].values, weights=active_weight)
 
-        # WALA (current)
-        metrics['curr_wala'] = np.average(current_only['orig_exp_payments_made'].values, weights=curr_weight)
+        # WALA (active)
+        metrics['curr_wala'] = np.average(active_loans['orig_exp_payments_made'].values, weights=active_weight)
 
-        # Average FICO (current)
-        metrics['curr_avg_fico'] = np.average(current_only['latest_fico'].fillna(0).values, weights=curr_weight)
+        # Average FICO (active)
+        metrics['curr_avg_fico'] = np.average(active_loans['latest_fico'].fillna(0).values, weights=active_weight)
 
-        # Average DTI (current)
-        metrics['curr_avg_dti'] = np.average(current_only['dti_clean'].fillna(0).values, weights=curr_weight)
+        # Average DTI (active)
+        metrics['curr_avg_dti'] = np.average(active_loans['dti_clean'].fillna(0).values, weights=active_weight)
     else:
         metrics['curr_wac'] = 0
         metrics['curr_wam'] = 0
@@ -389,12 +387,13 @@ def calculate_performance_metrics(df: pd.DataFrame,
 
             denominator = total_beginning_balance - total_scheduled_principal
             if denominator > 0:
-                smm_cpr = total_unscheduled_principal / denominator
+                smm_cpr = max(0.0, min(
+                    total_unscheduled_principal / denominator, 1.0))
                 cpr_val = 1 - (1 - smm_cpr) ** 12
             else:
-                cpr_val = 0
+                cpr_val = float('nan')
         else:
-            cpr_val = 0
+            cpr_val = float('nan')
 
         metrics['pool_cpr'] = cpr_val
 

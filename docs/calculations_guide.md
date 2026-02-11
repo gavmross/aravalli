@@ -209,7 +209,7 @@ CPR = 1 - (1 - SMM)^12
 2. **Single-period observation**: This CPR is based on the most recent payment period only (the last month in the dataset). It is not a multi-month average like CDR.
 3. **Pool-level aggregation**: SMM is computed at the pool level (sum of unscheduled principal / sum of eligible balances), not as an average of individual loan SMMs.
 4. **Prepayment definition**: Unscheduled principal = actual principal paid minus the amortization-scheduled principal. This captures voluntary prepayments and extra payments, but not full payoffs of matured loans (those are already Fully Paid).
-5. **Transition model usage**: In the dashboard's state-transition model, the empirical CPR is used to replace the historical Current → Fully Paid transition rate via `adjust_prepayment_rates()` (`src/cashflow_engine.py`, line 403). This prevents overstating prepayments from maturity payoffs.
+5. **Transition model usage**: In the dashboard's state-transition model, the empirical age-specific Current → Fully Paid transition rates from `compute_age_transition_probabilities()` are used directly. The `adjust_prepayment_rates()` function (which replaced all ages with a flat CPR-derived SMM) is deprecated and no longer called by the dashboard. The pool-level CPR is still displayed as a summary metric and used as a base reference for scenario CPR ratio scaling via `compute_implied_cpr()`.
 
 ---
 
@@ -327,15 +327,13 @@ Current → Delinquent (0-30) → Late_1 → Late_2 → Late_3 → Charged Off
                                                           → Fully Paid (absorbing)
 ```
 
-### Prepayment Rate Adjustment
+### Prepayment Rate Handling
 
-The raw empirical Current → Fully Paid transition rate includes both voluntary prepayments and natural maturity payoffs. Since matured loans inflate this rate, the dashboard calls `adjust_prepayment_rates()` (`src/cashflow_engine.py`, line 403) to replace it with the CPR-derived SMM:
+The empirical age-specific Current → Fully Paid transition rates are used directly by the dashboard. These rates capture the observed prepayment behavior at each loan age, preserving natural variation (e.g., newer loans prepay less than seasoned loans).
 
-```
-SMM = 1 - (1 - CPR)^(1/12)
-```
+**Deprecated**: The `adjust_prepayment_rates()` function previously replaced all age-specific rates with a flat CPR-derived SMM (`SMM = 1 - (1 - CPR)^(1/12)`). This is no longer called by the dashboard because it destroyed the age-dependent signal.
 
-The difference is shifted into Current → Current to maintain row sum = 1.0.
+**Scenario scaling**: For scenario analysis, CPR is adjusted via ratio scaling: `cpr_ratio = scenario_cpr / base_implied_cpr`, where `base_implied_cpr` is the UPB-weighted implied CPR from `compute_implied_cpr()`. Each age bucket's Current → Fully Paid rate is multiplied by this ratio, and the difference is shifted into Current → Current to maintain row sum = 1.0.
 
 ### Output
 

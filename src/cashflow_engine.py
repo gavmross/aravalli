@@ -159,6 +159,9 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
             performing_balance = 0.0
 
         mdr = default_upb / performing_balance if performing_balance > 0 else 0.0
+        # Clamp MDR to [0, 1] — values > 1 are numerical artifacts from
+        # tiny performing balances in nearly-terminated vintage subsets
+        mdr = min(mdr, 1.0)
         monthly_mdrs.append(mdr)
 
     avg_mdr = float(np.mean(monthly_mdrs))
@@ -189,12 +192,38 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
         total_unscheduled_principal = paid_cpr['last_pmt_unscheduled_principal'].sum()
         denominator = total_beginning_balance - total_scheduled_principal
         if denominator > 0:
-            smm = total_unscheduled_principal / denominator
+            smm = max(0.0, min(total_unscheduled_principal / denominator, 1.0))
             cpr = 1 - (1 - smm) ** 12
         else:
             cpr = 0.0
     else:
         cpr = 0.0
+
+    # --- CPR Split: Full Payoff vs Curtailment ---
+    # Both use the SAME combined denominator as total CPR so the two SMMs
+    # are additive (full_payoff_smm + curtailment_smm ≈ total smm).
+    if len(paid_cpr) > 0 and denominator > 0:
+        # Full payoff component: unscheduled principal from FP March loans
+        paid_fp = fp_march[fp_march['last_pmt_beginning_balance'] > 0] if 'last_pmt_beginning_balance' in fp_march.columns else fp_march.iloc[0:0]
+        fp_unsched = paid_fp['last_pmt_unscheduled_principal'].sum() if len(paid_fp) > 0 else 0.0
+        fp_smm = max(0.0, min(fp_unsched / denominator, 1.0))
+        full_payoff_cpr = 1 - (1 - fp_smm) ** 12
+
+        # Curtailment component: unscheduled principal from Current loans
+        paid_current = current_loans[current_loans['last_pmt_beginning_balance'] > 0] if 'last_pmt_beginning_balance' in current_loans.columns else current_loans.iloc[0:0]
+        cur_unsched = paid_current['last_pmt_unscheduled_principal'].sum() if len(paid_current) > 0 else 0.0
+        curtailment_smm = max(0.0, min(cur_unsched / denominator, 1.0))
+        curtailment_cpr = 1 - (1 - curtailment_smm) ** 12
+    else:
+        full_payoff_cpr = 0.0
+        curtailment_smm = 0.0
+        curtailment_cpr = 0.0
+
+    # Age-specific curtailment rates (from Current loans with timeline columns)
+    if 'loan_age_months' in current_loans.columns:
+        curtailment_rates = compute_curtailment_rates(current_loans)
+    else:
+        curtailment_rates = {}
 
     # --- Loss Severity ---
     # From Charged Off loans with positive exposure, capped recoveries
@@ -222,6 +251,10 @@ def compute_pool_assumptions(df_all: pd.DataFrame,
         'avg_mdr': avg_mdr,
         'monthly_mdrs': monthly_mdrs,
         'cpr': cpr,
+        'full_payoff_cpr': full_payoff_cpr,
+        'curtailment_smm': curtailment_smm,
+        'curtailment_cpr': curtailment_cpr,
+        'curtailment_rates': curtailment_rates,
         'loss_severity': loss_severity,
         'recovery_rate': recovery_rate,
     }
@@ -472,6 +505,14 @@ def adjust_prepayment_rates(age_probs: pd.DataFrame,
     """
     Replace empirical Current → Fully Paid rates with CPR-derived SMM.
 
+    .. deprecated::
+        This function is no longer used in the dashboard pipeline.
+        The empirical age-specific Current→Fully Paid rates from
+        compute_age_transition_probabilities() are used directly,
+        as they correctly capture age-dependent prepayment behavior
+        including near-maturity payoffs. Retained for backward
+        compatibility and reference.
+
     The empirical Current → Fully Paid transition rate from historical data
     includes all payoffs (maturity + voluntary prepayment), which overstates
     the forward-looking prepayment rate for currently performing loans.
@@ -524,6 +565,122 @@ def adjust_prepayment_rates(age_probs: pd.DataFrame,
                 adjusted.loc[ov_idx, col] *= scale
 
     return adjusted
+
+
+def compute_implied_cpr(age_probs: pd.DataFrame,
+                        pool_state: dict) -> float:
+    """
+    Compute pool-level implied CPR from age-specific Current→Fully Paid
+    transition probabilities, weighted by the pool's actual UPB at each age.
+
+    This gives a single CPR number that summarizes what the empirical
+    age-specific rates imply for the current pool composition. Used as
+    the denominator for scenario CPR ratio scaling.
+
+    Parameters
+    ----------
+    age_probs : pd.DataFrame
+        Output of compute_age_transition_probabilities(states='7state').
+    pool_state : dict
+        Output of build_pool_state(). Provides UPB by age for weighting.
+
+    Returns
+    -------
+    float — implied annual CPR
+    """
+    # Build lookup: age → Current→Fully Paid probability (SMM)
+    current_rows = age_probs[age_probs['from_status'] == 'Current']
+    smm_lookup = {}
+    max_age = 0
+    for _, row in current_rows.iterrows():
+        try:
+            age = int(row['age_bucket'])
+        except (ValueError, TypeError):
+            continue
+        smm_lookup[age] = float(row['to_fully_paid_pct'])
+        max_age = max(max_age, age)
+
+    current_upb = pool_state.get('states', {}).get('Current', {})
+    if not current_upb or not smm_lookup:
+        return 0.0
+
+    weighted_sum = 0.0
+    total_upb = 0.0
+
+    for age, upb in current_upb.items():
+        if upb <= 0:
+            continue
+
+        # Look up SMM at this age, capped at max known age
+        lookup_age = min(int(age), max_age)
+        if lookup_age in smm_lookup:
+            smm = smm_lookup[lookup_age]
+        else:
+            # Search downward for nearest available age
+            smm = 0.0
+            for a in range(lookup_age, -1, -1):
+                if a in smm_lookup:
+                    smm = smm_lookup[a]
+                    break
+
+        weighted_sum += smm * upb
+        total_upb += upb
+
+    if total_upb <= 0:
+        return 0.0
+
+    weighted_avg_smm = weighted_sum / total_upb
+    implied_cpr = 1 - (1 - weighted_avg_smm) ** 12
+
+    return implied_cpr
+
+
+def compute_curtailment_rates(df_current: pd.DataFrame) -> dict[int, float]:
+    """
+    Compute age-specific curtailment rates (partial prepayment SMM) from Current loans.
+
+    For Current loans, last_pmt_unscheduled_principal represents partial extra
+    payments (curtailments), not full payoffs. This function computes the monthly
+    curtailment rate at each loan age.
+
+    Parameters
+    ----------
+    df_current : pd.DataFrame
+        Current loans only (status='Current', last_pymnt_d='2019-03-01') with
+        calc_amort columns (last_pmt_beginning_balance, last_pmt_scheduled_principal,
+        last_pmt_unscheduled_principal) and loan_age_months from
+        reconstruct_loan_timeline().
+
+    Returns
+    -------
+    dict[int, float]
+        Mapping loan age (months) → curtailment SMM (0 to 1).
+    """
+    if len(df_current) == 0:
+        return {}
+
+    required = ['loan_age_months', 'last_pmt_beginning_balance',
+                 'last_pmt_scheduled_principal', 'last_pmt_unscheduled_principal']
+    for col in required:
+        if col not in df_current.columns:
+            logger.warning("compute_curtailment_rates: missing column '%s'", col)
+            return {}
+
+    rates = {}
+    grouped = df_current.groupby('loan_age_months')
+    for age, group in grouped:
+        numerator = group['last_pmt_unscheduled_principal'].sum()
+        denominator = (
+            group['last_pmt_beginning_balance'].sum()
+            - group['last_pmt_scheduled_principal'].sum()
+        )
+        if denominator > 0:
+            smm = max(0.0, min(numerator / denominator, 1.0))
+        else:
+            smm = 0.0
+        rates[int(age)] = smm
+
+    return rates
 
 
 def build_pool_state(df: pd.DataFrame,
@@ -701,6 +858,7 @@ def project_cashflows_transition(
     recovery_rate: float,
     pool_chars: dict,
     num_months: int,
+    curtailment_rates: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     """
     Project monthly cash flows using the 7-state transition model.
@@ -726,6 +884,9 @@ def project_cashflows_transition(
         Pool characteristics (wac, monthly_payment used for interest/principal).
     num_months : int
         Number of months to project.
+    curtailment_rates : dict[int, float] | None
+        Age-specific curtailment SMM rates from compute_curtailment_rates().
+        If None, no curtailments applied (backward compatible).
 
     Returns
     -------
@@ -835,12 +996,32 @@ def project_cashflows_transition(
             for age in new_states['Current']:
                 new_states['Current'][age] *= scale
 
+        # Apply curtailments (partial prepayments from loans staying Current)
+        curtailments = 0.0
+        if curtailment_rates:
+            max_curt_age = max(curtailment_rates.keys()) if curtailment_rates else 0
+            for age in list(new_states['Current'].keys()):
+                upb = new_states['Current'][age]
+                if upb <= 0:
+                    continue
+                # Lookup curtailment rate (nearest lower age fallback)
+                lookup_age = min(age, max_curt_age)
+                c_rate = 0.0
+                for a in range(lookup_age, -1, -1):
+                    if a in curtailment_rates:
+                        c_rate = curtailment_rates[a]
+                        break
+                if c_rate > 0:
+                    curtailment = upb * c_rate
+                    new_states['Current'][age] -= curtailment
+                    curtailments += curtailment
+
         # Losses and recoveries from new defaults
         losses = new_defaults * loss_severity
         recoveries = new_defaults * recovery_rate
 
         cumulative_default += new_defaults
-        cumulative_paid += prepayments + sched_principal
+        cumulative_paid += prepayments + curtailments + sched_principal
 
         # Ending balance = all non-absorbing states
         ending_current = sum(new_states['Current'].values())
@@ -850,7 +1031,7 @@ def project_cashflows_transition(
         ending_l3 = sum(new_states['Late_3'].values())
         ending_balance = ending_current + ending_delinq + ending_l1 + ending_l2 + ending_l3
 
-        total_cashflow = interest + sched_principal + prepayments + recoveries
+        total_cashflow = interest + sched_principal + prepayments + curtailments + recoveries
 
         rows.append({
             'month': t,
@@ -859,10 +1040,11 @@ def project_cashflows_transition(
             'interest': round(interest, 2),
             'scheduled_principal': round(sched_principal, 2),
             'prepayments': round(prepayments, 2),
+            'curtailments': round(curtailments, 2),
             'defaults': round(new_defaults, 2),
             'loss': round(losses, 2),
             'recovery': round(recoveries, 2),
-            'total_principal': round(sched_principal + prepayments, 2),
+            'total_principal': round(sched_principal + prepayments + curtailments, 2),
             'ending_balance': round(ending_balance, 2),
             'total_cashflow': round(total_cashflow, 2),
             'current_upb': round(ending_current, 2),
@@ -887,6 +1069,7 @@ def solve_price_transition(
     pool_chars: dict,
     num_months: int,
     target_irr: float,
+    curtailment_rates: dict[int, float] | None = None,
 ) -> Optional[float]:
     """
     Find the purchase price that achieves a target IRR (transition model).
@@ -910,6 +1093,8 @@ def solve_price_transition(
         Number of months to project.
     target_irr : float
         Target annualized IRR (e.g., 0.12 for 12%).
+    curtailment_rates : dict[int, float] | None
+        Age-specific curtailment SMM rates. If None, no curtailments applied.
 
     Returns
     -------
@@ -918,7 +1103,7 @@ def solve_price_transition(
     """
     cf_df = project_cashflows_transition(
         pool_state, age_probs, loss_severity, recovery_rate,
-        pool_chars, num_months,
+        pool_chars, num_months, curtailment_rates=curtailment_rates,
     )
 
     if len(cf_df) == 0:
